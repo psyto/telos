@@ -21,7 +21,7 @@ telos-listener = { path = "crates/telos-listener" }
 telos-settler = { path = "crates/telos-settler" }
 
 alloy = { version = "1.0", features = ["full"] }
-revm = "38"
+revm = { version = "38", features = ["alloydb"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

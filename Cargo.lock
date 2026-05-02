@@ -3499,11 +3499,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c281a1f11d3bcb8c0bba1199ed6bcb001d1aeb3d4fb366819e14f88723989a4e"
 dependencies = [
  "alloy-eips",
+ "alloy-provider",
+ "alloy-transport",
  "revm-bytecode",
  "revm-database-interface",
  "revm-primitives",
  "revm-state",
  "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -3518,6 +3521,7 @@ dependencies = [
  "revm-state",
  "serde",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -4343,9 +4347,11 @@ dependencies = [
 name = "telos-settler"
 version = "0.0.1"
 dependencies = [
+ "alloy",
  "eyre",
  "revm",
  "telos-types",
+ "tokio",
  "tracing",
 ]
 

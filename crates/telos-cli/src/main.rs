@@ -8,12 +8,13 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cfg = Config::from_env()?;
+    let fork_url = cfg.fork_url.clone();
 
     match cfg.mode() {
         Mode::Both { tempo_url, tempo_contract, hl_url, hl_contract } => {
-            watch_both(&tempo_url, tempo_contract, &hl_url, hl_contract).await
+            watch_both(&tempo_url, tempo_contract, &hl_url, hl_contract, fork_url).await
         }
-        Mode::Intents { url, contract } => watch_intents(&url, contract).await,
+        Mode::Intents { url, contract } => watch_intents(&url, contract, fork_url).await,
         Mode::Fills { url, contract } => watch_fills(&url, contract).await,
         Mode::Headers { url } => watch_headers(&url).await,
     }
@@ -25,6 +26,7 @@ struct Config {
     tempo_contract: Option<Address>,
     hl_url: Option<String>,
     hl_contract: Option<Address>,
+    fork_url: Option<String>,
 }
 
 enum Mode {
@@ -48,6 +50,7 @@ impl Config {
             tempo_contract: parse_addr("TELOS_TEMPO_CONTRACT")?,
             hl_url: std::env::var("TELOS_HL_WS_URL").ok(),
             hl_contract: parse_addr("TELOS_HL_CONTRACT")?,
+            fork_url: std::env::var("TELOS_TEMPO_FORK_URL").ok(),
         })
     }
 
