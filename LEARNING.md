@@ -1,191 +1,434 @@
-# Telos Learning Notes
+# Telos Learning Walkthrough
 
-Concepts internalized while building Telos, organized by topic. Each entry has the rule, why it matters, and a pointer to where it lives in the code.
+A week-by-week build journey through the modern Rust + Ethereum stack —
+**Alloy** (typed clients), **REVM** (Rust EVM), and the surrounding
+**tokio** patterns you cannot avoid. By the end, you will have built an
+intent-based aggregator that listens on two chains, simulates execution
+against forked state, and broadcasts hedges when the simulation approves.
 
-This is the practical companion to [psyto/rethlab](https://github.com/psyto/rethlab) — RethLab covers the theory by reading source, Telos shows what those concepts look like when wired into a real system.
+This is the practical companion to [psyto/rethlab](https://github.com/psyto/rethlab) —
+RethLab teaches the stack from source, Telos shows what those concepts
+look like once they are wired into a working system.
 
----
+## How to read this
 
-## Alloy
+Each chapter tells you the same story:
 
-### `sol!` accepts multiple declarations in one block
-Events, structs, errors, and full interfaces can be declared together. They share generated infrastructure and stay co-located with the contract surface they describe.
-- **Why:** the Solidity declaration *is* the source of truth; the Rust types are generated. No drift between on-chain interface and Rust struct.
-- **Where:** `crates/telos-listener/src/abi.rs`, `crates/telos-settler/src/abi.rs` (commits b31d22e, ada0751)
+1. **What you build** — the concrete deliverable that week.
+2. **What you learn** — the concepts you have to internalize to make it work.
+3. **Where to look** — the file + commit so you can read the diff.
 
-### `From<GeneratedType> for DomainType` is the seam
-`sol!` generates wire-format types with Solidity casing (`intentId`, not `intent_id`). The conversion impl is the boundary between *generated* and *domain* code.
-- **Why:** future contract changes get isolated to the seam — call sites keep using domain types. Don't pass generated types around.
-- **Where:** `crates/telos-listener/src/abi.rs` (commit b31d22e)
-
-### `Filter` builder for typed log subscriptions
-`Filter::new().address(contract).event_signature(EventType::SIGNATURE_HASH)` is the canonical pattern. Wrap in a private helper when you have multiple subscriptions against different addresses.
-- **Why:** event signatures are computed at compile time from the `sol!` macro, so the filter is type-safe.
-- **Where:** `intent_filter` and `fill_filter` in `crates/telos-listener/src/lib.rs` (commit ada0751)
-
-### `SolCall::abi_encode()` for outbound calldata
-Every Solidity function `foo(...)` becomes a `fooCall { ... }` struct. Construct it with the args, call `.abi_encode()`, and you have selector + ABI-encoded args ready for `TxEnv.data` or `TransactionRequest.input`.
-- **Why:** same encoding path for simulation (REVM) and broadcast (Alloy provider). One mental model.
-- **Where:** `build_spot_tx`, `hedge_calldata` in `crates/telos-settler/src/lib.rs` (commits 024e3e9, 03bc090)
-
-### Revert decoding requires the `SolError` trait in scope
-`Revert::abi_decode(output)` needs `use alloy::sol_types::SolError;` — the compiler error points right at it. The trait gates the entire decode/encode infrastructure for revert types.
-- **Why:** rustc's "trait not in scope" hint is your debugger. Especially with `sol!`-generated code where the trait often isn't obvious from the type name.
-- **Where:** `decode_revert_reason` in `crates/telos-settler/src/lib.rs` (commit 024e3e9)
-
-### Wallet-aware provider via `ProviderBuilder::new().wallet(wallet)`
-The `wallet` filler middleware composes with default fillers (nonce, gas, chain-id), so `provider.send_transaction(tx)` produces a fully-formed signed tx from a sparse `TransactionRequest`.
-- **Why:** modern Alloy lets you write business logic against unsigned/incomplete txs; middleware handles the rest. Don't build TransactionRequests yourself when you can let the chain.
-- **Where:** `Submitter::submit_and_confirm` in `crates/telos-submitter/src/lib.rs` (commit 138bdf2)
-
-### `PendingTransactionBuilder` for confirmation budgets
-`pending.with_required_confirmations(n).with_timeout(Some(d)).get_receipt().await` is Alloy's canonical wait-for-confirmation pattern. Each builder method returns `Self`; `get_receipt()` consumes the chain.
-- **Why:** policy lives in the builder, business logic stays clean. Tune `confirmations` per chain and per asset.
-- **Where:** `Submitter::submit_and_confirm` in `crates/telos-submitter/src/lib.rs` (commit 5a97014)
-
-### `receipt.status()` is the EIP-658 success bit
-`true` = success, `false` = revert. Pre-Byzantium chains report by post-state hash instead, but Alloy abstracts that. Don't second-guess.
-- **Why:** receipts don't carry revert data, only this bit + logs. To get revert *reasons* from a failed receipt, re-call `eth_call` against the same block.
-- **Where:** `Submitter::submit_and_confirm` in `crates/telos-submitter/src/lib.rs` (commit 5a97014)
+The chapters are deliberately ordered. Earlier weeks set up muscle memory
+that later weeks rely on. The reference table at the end lets you jump
+back when you need to look something up.
 
 ---
 
-## REVM
+## Week 1 — Alloy read path
 
-### `Context::mainnet()` is the modern entry point
-`Context::mainnet().with_db(...).build_mainnet()` — the `MainBuilder` and `MainContext` traits gate the chained API; `ExecuteEvm` provides `transact`. Four imports cover the minimum surface for any synchronous simulation.
-- **Where:** `simulate_settlement` in `crates/telos-settler/src/lib.rs` (commit c983ed1)
+**What you build.** A Cargo workspace with a single binary that opens a
+WebSocket subscription to an Ethereum RPC and prints incoming block
+headers. Then, a typed log subscription for a `PaymentIntent` event you
+declare in inline Solidity.
 
-### EIP-8037 split execution gas from state gas
-`gas_used()` is now ambiguous and deprecated. Use `tx_gas_used()` for the per-tx total. The split exists for stateless-client pricing of state access.
-- **Where:** `decode_leg` in `crates/telos-settler/src/lib.rs` (commit c983ed1)
+**What you learn.**
 
-### `ExecutionResult` is a sum type, not a boolean
-Match on `Success { logs, output }`, `Revert { output }`, `Halt { reason }`. The output bytes mean different things in each variant: return data on success, revert payload on revert, nothing on halt.
-- **Why:** `is_success() / else fail` collapses the most useful diagnostic. *Why* it failed matters more than that it failed.
-- **Where:** `decode_leg`, `scan_transfer_event` in `crates/telos-settler/src/lib.rs` (commits 024e3e9, 03bc090)
+The first muscle is `ProviderBuilder::new().connect_ws(...)` — Alloy's
+canonical "give me a provider that talks to a chain over WebSocket"
+pattern. From there, `provider.subscribe_blocks().await?.into_stream()`
+gives you back a `Stream<Item = Header>` you can `while let Some(...)`
+over. You are writing async Rust against typed wire formats; no
+hand-rolled JSON-RPC.
 
-### `Context` is mutable across `transact` calls
-The hedge tx sees the spot tx's post-state — nonces incremented, balances changed, storage written. This is *the* property that makes REVM useful for sequential simulation.
-- **Why:** if you wanted isolated per-tx execution, you'd reset the DB between calls. Sequential `transact` is correct for "what happens if these run in order."
-- **Where:** `run_legs` in `crates/telos-settler/src/lib.rs` (commit 03bc090)
+The second muscle is `sol!`. You declare an event in Solidity inside
+a `sol! { ... }` block, and the macro generates a Rust struct that
+implements `SolEvent` (carrying `SIGNATURE_HASH` and `decode_log`).
+The Solidity declaration *is* the source of truth — your Rust types
+cannot drift from the on-chain interface, because they are generated
+from it.
 
-### Generic over `DB` for code reuse
-`run_legs<DB>` works against `CacheDB<EmptyDB>` and `CacheDB<WrapDatabaseAsync<AlloyDB>>` alike. The trait bound `where DB: Database, DB::Error: std::error::Error + Send + Sync + 'static` is the minimum needed for `eyre`'s `?` to flow through.
-- **Where:** `run_legs` in `crates/telos-settler/src/lib.rs` (commit 03bc090)
+The seam between *generated* and *domain* code is a `From` impl. The
+`sol!` macro emits types with Solidity casing (`intentId`); your domain
+types use snake_case (`intent_id`). The `From<abi::PaymentIntent> for
+telos_types::PaymentIntent` impl is the *one place* the conversion
+lives. Future contract changes get isolated here — call sites keep
+using domain types.
 
-### The `alloydb` feature is non-default
-REVM's umbrella crate hides the Alloy adapter behind `features = ["alloydb"]`. Discovering this is the first lesson in REVM's modular crate split.
-- **Where:** `Cargo.toml` workspace deps (commit ea85199)
+The third muscle is the typed filter:
+`Filter::new().address(contract).event_signature(EventType::SIGNATURE_HASH)`.
+Wrap it in a private helper the moment you have more than one
+subscription. The signature hash is computed at compile time from the
+`sol!` macro, so the filter is type-safe.
 
-### Async/sync bridge: `WrapDatabaseAsync` + `spawn_blocking` + `Handle::enter()`
-`AlloyDB`'s state-fetch is async, REVM's `Database` trait is sync. `WrapDatabaseAsync::new(...)` calls `block_on` internally, which **deadlocks inside an async worker**. Move the simulation to `tokio::task::spawn_blocking` and call `handle.enter()` on the blocking thread so the wrapped DB submits fetches back to the parent runtime.
-- **Why:** without `_enter`, the blocking thread has no current runtime and `WrapDatabaseAsync::new` returns `None`. The implicit thread-local runtime context matters.
-- **Where:** `simulate_settlement_forked` in `crates/telos-settler/src/lib.rs` (commit ea85199)
+**Where to look.**
 
----
-
-## Tokio
-
-### `tokio::select!` arms must be cancel-safe
-Every arm uses `StreamExt::next`, which is cancel-safe. If you put a non-cancel-safe future in an arm, you lose data on every loop where the *other* arm fires.
-- **Why:** the single most important thing to internalize about `select!`. When in doubt, `tokio::spawn` the work and let `select!` only handle stream demultiplexing.
-- **Where:** `watch_both` in `crates/telos-listener/src/lib.rs` (commit ada0751)
-
-### Spawn rather than await in `select!` arms
-A 200ms simulation awaited inline blocks the next event. `tokio::spawn(handle_thing(item))` makes per-item work independent — the listener loop stays at sub-ms latency.
-- **Why:** trade-off is no backpressure (a slow downstream could spawn unbounded tasks). Real for scale; fine for now.
-- **Where:** `spawn_simulation` in `crates/telos-listener/src/lib.rs` (commit ea85199)
-
-### `tokio::sync::RwLock` vs `std::sync::RwLock`
-Tokio's lock yields the task and is correct inside async functions. `std::sync::RwLock` blocks the worker thread. `parking_lot::RwLock` works inside async if the critical section is microseconds.
-- **Where:** `PriceBook` in `crates/telos-settler/src/lib.rs` (commit 85b5a14)
-
-### Errors vs outcomes in async APIs
-Submitter-level errors (invalid RPC, signer error) propagate as `Result::Err`. Transaction-level outcomes (revert, timeout) come back as `Ok(SettlementResult::Failed | Timeout)`.
-- **Why:** a revert is *normal operation* — the system did its job, the chain rejected the tx. Forcing callers to `match err.downcast()` to handle expected outcomes is wrong.
-- **Where:** `Submitter::submit_and_confirm` in `crates/telos-submitter/src/lib.rs` (commit 5a97014)
+- `crates/telos-listener/src/lib.rs` — `watch_headers` ([3ba07dd](https://github.com/psyto/telos/commit/3ba07dd))
+- `crates/telos-listener/src/abi.rs` — `sol!` block + From impl ([b31d22e](https://github.com/psyto/telos/commit/b31d22e))
+- `crates/telos-listener/src/lib.rs` — `intent_filter`, `decode_intent` ([b31d22e](https://github.com/psyto/telos/commit/b31d22e))
 
 ---
 
-## API Design
+## Week 2 — Multiplex two streams
 
-### Hide sync primitives behind a struct
-`Arc<RwLock<HashMap<Address, PriceQuote>>>` exposed as a type alias leaks lock semantics to every caller. Hiding it behind methods (`record_fill`, `get`) means you can swap to `parking_lot::RwLock`, an LRU cache, or a sharded map without touching call sites.
-- **Where:** `PriceBook` in `crates/telos-settler/src/lib.rs` (commit 85b5a14)
+**What you build.** A second typed subscription for Hyperliquid `Fill`
+events on a different chain, then a `watch_both` function that runs
+both subscriptions concurrently using `tokio::select!`.
 
-### Per-leg outcomes vs single boolean
-`SimulationOutcome { spot, hedge, atomic_success }` lets you see *which* leg blocked atomicity. A bare `bool` collapses information you'll want during debugging — "the hedge would have worked but the spot reverted because the payer's allowance was zero" is a different problem from "the hedge venue address has no bytecode."
-- **Where:** `LegOutcome`, `SimulationOutcome` in `crates/telos-settler/src/lib.rs` (commit 03bc090)
+**What you learn.**
 
-### Sum type for decisions
-`SettlerDecision::Submit(SubmissionPlan)` carries *what to send*; `SettlerDecision::Reject(RejectReason)` carries *why not*. Both branches log structured information.
-- **Why:** a `Result<SubmissionPlan>` would conflate "no quote yet" with "system error" — operationally very different.
-- **Where:** `should_submit` in `crates/telos-settler/src/lib.rs` (commit 138bdf2)
+`tokio::select!` is the routing-loop primitive every async Rust app
+eventually needs. Its single most important property is
+**cancel-safety**: when one arm fires, the futures in the other arms
+are *dropped*. If those dropped futures had partial state (a half-read
+buffer, an in-flight write), you lose it. `StreamExt::next` is
+documented as cancel-safe, so a `select!` over two streams works
+correctly. Internalize this rule first; it will save you from data
+loss in every async program you write.
 
-### `Option<T>` as soft failure
-"No price for the asset yet" isn't an error, it's a state. Returning `Option<RouteQuote>` (not `Result`) makes the absence first-class. The listener logs a warning and proceeds; once a fill arrives, the next intent gets a real quote without retry logic.
-- **Where:** `quote_route` in `crates/telos-settler/src/lib.rs` (commit 85b5a14)
+The second pattern: when the work in an arm is non-trivial, do not
+`.await` it inside the arm. `tokio::spawn(handle_thing(item))`
+detaches the work onto its own task so the `select!` loop stays
+responsive to the next event. The trade-off is no backpressure — a
+slow downstream can spawn unbounded tasks. That is real for
+production; fine for now.
 
-### Two gates for risky operations
-The submitter's `broadcast: bool` is captured at construction *and* `TELOS_BROADCAST=1` is required at the CLI. Either gate alone keeps you in dry-run.
-- **Why:** defense in depth. A misconfigured submitter that silently broadcasts is unrecoverable. The dry-run default should never quietly flip.
-- **Where:** `Submitter::new` and `Config::from_env` (commit 138bdf2)
+**Where to look.**
 
-### Compile-time `Send + Sync` guard
+- `crates/telos-listener/src/lib.rs` — `watch_both`, `tokio::select!` block ([ada0751](https://github.com/psyto/telos/commit/ada0751))
+- `crates/telos-cli/src/main.rs` — env-driven mode dispatch (`Config::from_env`, `Mode`) ([ada0751](https://github.com/psyto/telos/commit/ada0751))
+
+---
+
+## Week 3 — REVM in-memory, then forked
+
+**What you build.** A `telos-settler` crate that takes a decoded
+`PaymentIntent` and replays it through REVM. First against an empty
+in-memory state (proves the harness wires up), then against forked
+state pulled from a live RPC via `AlloyDB`.
+
+**What you learn.**
+
+REVM 38's modern entry point is `Context::mainnet().with_db(db).build_mainnet()`.
+The `MainBuilder` and `MainContext` traits gate the chained API; the
+`ExecuteEvm` trait provides `transact`. Four imports cover the
+minimum surface for any synchronous simulation. Once you have it set
+up, calling `evm.transact(tx_env)?` returns an `ExecutionResult`.
+
+Then EIP-8037 surprises you: `ExecutionResult::gas_used()` is
+deprecated in favour of `tx_gas_used()`. The split exists for
+stateless-client pricing of state access — execution gas and state
+gas are now distinct dimensions. You only need the per-tx total, but
+the rename is worth understanding rather than mechanically following.
+
+The hard problem of Week 3 is forking. You want to fetch real chain
+state on demand: account balances, nonces, contract bytecode, storage
+slots. REVM's `Database` trait is **sync**; `AlloyDB`'s state-fetch
+is **async**. The bridge is `WrapDatabaseAsync`, which calls
+`block_on` on a tokio handle. From inside an async worker, that
+**deadlocks**. The fix is a recipe you will reuse forever:
+
+```rust
+let handle = tokio::runtime::Handle::current();
+tokio::task::spawn_blocking(move || {
+    let _enter = handle.enter();
+    let alloy_db = AlloyDB::new(provider, block);
+    let wrapped = WrapDatabaseAsync::new(alloy_db).unwrap();
+    // ... build evm and transact ...
+})
+.await
+```
+
+`spawn_blocking` moves the work onto a dedicated OS thread. `_enter =
+handle.enter()` makes the parent runtime's `Handle` reachable via
+`Handle::current()` on that thread, so `WrapDatabaseAsync::new` finds
+a runtime to schedule its async fetches against. Without `_enter`,
+the call returns `None`. The implicit thread-local runtime context is
+something tokio leans on heavily; learn to spot it.
+
+**Where to look.**
+
+- `crates/telos-settler/src/lib.rs` — `simulate_settlement` (in-memory) ([c983ed1](https://github.com/psyto/telos/commit/c983ed1))
+- `crates/telos-settler/src/lib.rs` — `simulate_settlement_forked` ([ea85199](https://github.com/psyto/telos/commit/ea85199))
+- `Cargo.toml` — `revm = { version = "38", features = ["alloydb"] }` ([ea85199](https://github.com/psyto/telos/commit/ea85199))
+
+---
+
+## Week 4 — Real calldata, real revert reasons
+
+**What you build.** Replace the symbolic `value=0` test transaction
+with an actual `IERC20.transfer(merchant, amount)` call, encoded via
+`sol!`-generated bindings. Decode the receipt: extract revert reasons
+when the tx fails, find the matching `Transfer` event when it
+succeeds.
+
+**What you learn.**
+
+`SolCall::abi_encode()` is the workhorse. Every Solidity function
+`foo(...)` becomes a `fooCall { ... }` Rust struct. Construct it with
+the args, call `.abi_encode()`, and you get selector + ABI-encoded
+args ready for `TxEnv.data`. Same encoding path you will later use
+for broadcast — one mental model covers simulation and submission.
+
+`ExecutionResult` is a sum type, not a boolean. Match on `Success {
+logs, output }`, `Revert { output }`, `Halt { reason }`. The output
+bytes mean different things in each variant: return data on success,
+revert payload on revert, nothing on halt. Treating it as
+`is_success() / else fail` collapses the most useful diagnostic. *Why*
+it failed matters more than that it failed.
+
+For revert reasons, `alloy::sol_types::Revert::abi_decode(output)`
+extracts the standard `Error(string)` payload — the one OpenZeppelin's
+ERC-20 emits ("ERC20: transfer amount exceeds balance"). It needs
+`SolError` in scope; the compiler error tells you so. That trait
+gates the entire decode/encode infrastructure for revert types.
+Custom errors and `Panic(uint256)` would each need their own selector
+match; defer until you hit one.
+
+**Where to look.**
+
+- `crates/telos-settler/src/lib.rs` — `build_spot_tx`, `decode_outcome`, `decode_revert_reason` ([024e3e9](https://github.com/psyto/telos/commit/024e3e9))
+- `crates/telos-settler/src/abi.rs` — `IERC20` interface ([024e3e9](https://github.com/psyto/telos/commit/024e3e9))
+
+---
+
+## Week 5 — A feedback loop with shared state
+
+**What you build.** A `PriceBook` that records HL `Fill` events as
+mark prices keyed by spot asset. When a `PaymentIntent` decodes, the
+listener reads the book to size the hedge. Same task pool, shared
+state, no channels.
+
+**What you learn.**
+
+The lock you reach for inside async code is `tokio::sync::RwLock`.
+Its `read()` and `write()` futures yield the task instead of blocking
+the worker thread. `std::sync::RwLock` would block — fatal in a
+single-threaded scheduler, fine but wasteful in a multi-threaded one.
+`parking_lot::RwLock` is correct inside async if your critical
+section is microseconds; learn to spot when each applies.
+
+Hide the lock behind a struct, not a type alias. Exposing
+`Arc<RwLock<HashMap<Address, PriceQuote>>>` to every caller leaks
+your storage choice. Wrapping it in `PriceBook` with `record_fill`
+and `get` methods means you can swap in `parking_lot::RwLock`, an
+LRU cache, or a sharded map later without touching call sites.
+
+`Option<T>` is the right shape for "no price observed yet." It is
+not an error — it is a state. Returning `Option<RouteQuote>` (rather
+than `Result<RouteQuote, NoPriceError>`) makes the absence first-class.
+The listener logs a warning and proceeds; once a fill arrives, the
+next intent gets a real quote without retry logic.
+
+The architectural insight: a feedback loop in the same process does
+not need channels. Channels become necessary when writer and reader
+run on different processes, or when the writer needs backpressure
+against a slow reader. Reaching for them prematurely adds overhead
+and complexity for problems you do not have.
+
+**Where to look.**
+
+- `crates/telos-settler/src/lib.rs` — `PriceBook`, `quote_route` ([85b5a14](https://github.com/psyto/telos/commit/85b5a14))
+- `crates/telos-listener/src/lib.rs` — `decode_fill` writes, `spawn_simulation` reads ([85b5a14](https://github.com/psyto/telos/commit/85b5a14))
+
+---
+
+## Week 6 — Two legs in one EVM context
+
+**What you build.** Layer the perp hedge into the simulation as a
+second transaction. The settler now runs the spot transfer, then —
+against the same EVM — runs `IHyperliquidGateway.placeShort(...)`.
+Both legs together either succeed atomically or you know which one
+broke.
+
+**What you learn.**
+
+REVM's `Context` is **mutable across `transact` calls**. The hedge
+tx sees the post-state of the spot tx — nonces incremented, balances
+changed, storage written. This is *the* property that makes REVM
+useful for sequential simulation. If you wanted isolated per-tx
+execution, you would reset the DB between calls. Sequential
+`transact` is correct for "what happens if these run in order."
+
+When the same logic needs to run against two different database
+backends (`CacheDB<EmptyDB>` for empty state, `CacheDB<WrapDatabaseAsync<AlloyDB>>`
+for forked state), make the function generic over `DB`. The trait
+bound `where DB: Database, DB::Error: std::error::Error + Send +
+Sync + 'static` is the minimum needed for `eyre`'s `?` operator to
+flow through. You write the leg-walking code once; it compiles
+against both worlds.
+
+The reporting shape matters. A `bool` for "did the simulation
+succeed" collapses information you will want during debugging. A
+`SimulationOutcome { spot: LegOutcome, hedge: Option<LegOutcome>,
+atomic_success: bool }` lets you see *which* leg blocked atomicity.
+"The hedge would have worked but the spot reverted because the
+allowance was zero" is operationally different from "the hedge venue
+has no bytecode." Per-leg outcomes preserve that.
+
+Mock interfaces are a legitimate development tool. `IHyperliquidGateway.placeShort`
+will never exist on real HL — that chain routes through L1 actions
+via CoreWriter precompiles. But for *simulation*, the settler only
+needs a known selector to encode and a known event signature to
+detect. The mock lets the rest of the architecture solidify before
+you wire the real plumbing.
+
+**Where to look.**
+
+- `crates/telos-settler/src/lib.rs` — `run_legs<DB>`, `LegOutcome`, `SimulationOutcome` ([03bc090](https://github.com/psyto/telos/commit/03bc090))
+- `crates/telos-settler/src/abi.rs` — `IHyperliquidGateway` mock interface ([03bc090](https://github.com/psyto/telos/commit/03bc090))
+
+---
+
+## Week 7 — Decision gate and dry-run-default broadcast
+
+**What you build.** The settler stops at "would this work" and
+starts at "should we send it." A `should_submit(outcome, route, intent,
+cfg)` function returns `Submit(SubmissionPlan)` or `Reject(RejectReason)`.
+A new `telos-submitter` crate takes the plan and broadcasts via an
+Alloy wallet-aware provider — but defaults to dry-run.
+
+**What you learn.**
+
+A sum type for decisions beats `Result<SubmissionPlan>`. `SettlerDecision::Submit`
+carries *what to send*; `Reject` carries *why not*. Both branches log
+structured information. A `Result` would conflate "no quote yet" (a
+state) with "system error" (a bug). Keep operationally distinct
+outcomes in distinct variants.
+
+The Alloy wallet-aware provider is `ProviderBuilder::new().wallet(wallet).connect_http(url)`.
+The `wallet` filler middleware composes with default fillers — nonce,
+gas, chain-id — so `provider.send_transaction(tx)` produces a
+fully-formed signed tx from a sparse `TransactionRequest`. You write
+business logic against unsigned/incomplete txs; middleware fills the
+rest. Do not build TransactionRequests by hand when you can let the
+chain.
+
+Risky operations need **two gates**. The submitter's `broadcast: bool`
+is captured at construction *and* `TELOS_BROADCAST=1` is required at
+the CLI. Either gate alone keeps you in dry-run. This is defense in
+depth: a misconfigured submitter that silently broadcasts is
+unrecoverable, so the dry-run default should never quietly flip.
+
+A compile-time `Send + Sync` guard is one of the cheapest correctness
+mechanisms in Rust:
+
 ```rust
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Submitter>();
 };
 ```
-If a future change adds an `Rc` or `RefCell` field, the build breaks at this line. Since the listener clones `Submitter` across async tasks, that property must hold.
-- **Why:** catching it at compile time beats discovering it at runtime when a clone fails.
-- **Where:** bottom of `crates/telos-submitter/src/lib.rs` (commits 138bdf2, 5a97014)
 
-### Single source of truth for the ABI
-Both the simulator and the submitter need to decode `OrderPlaced`. Promoting `mod abi` to `pub mod abi` is the cleanest way to share — though `abi` becomes part of the crate's public surface and breaking changes there ripple.
-- **Where:** `crates/telos-settler/src/lib.rs` (commit 5a97014)
+Since the listener clones `Submitter` across async tasks, that
+property must hold. If a future change adds an `Rc` or `RefCell`
+field, the build breaks at this line. Catching it at compile time
+beats discovering it at runtime when a clone fails.
 
----
+The architectural decision worth flagging: **Telos signs only what
+Telos owns**. The spot leg is the merchant's settlement, initiated
+by the payer on Tempo — observed for *gating* but not broadcast.
+Telos signs only the hedge. A bundler/Permit2 design that pulls
+tokens from the payer would change that scope. Decisions about *who
+signs what* are architectural, not implementation details — they
+constrain the trust model and the regulatory surface.
 
-## Architecture
+**Where to look.**
 
-### Mode dispatch from env
-Clean separation of `Config::from_env()` (parsing) from `Mode` (intent). Same pattern you'd use in production with clap or a config file.
-- **Where:** `Config` and `Mode` in `crates/telos-cli/src/main.rs` (commit ada0751)
-
-### The feedback-loop shape
-HL fills update the `PriceBook`; intents read it. Same task pool, shared state, no channels yet. Channels become necessary when writer and reader run on different processes or the writer needs backpressure.
-- **Why:** worth knowing when *not* to reach for channels. Premature channelization adds overhead and complexity for problems you don't have.
-- **Where:** `watch_both`, `spawn_simulation` in `crates/telos-listener/src/lib.rs` (commit 85b5a14)
-
-### Inline vs worker placement
-The simulation runs in the listener's read loop *for now* because it's microseconds. When fork-from-RPC arrives it becomes milliseconds and needs `tokio::spawn`. The decision deserves a comment at the call site.
-- **Where:** `spawn_simulation` in `crates/telos-listener/src/lib.rs` (commits c983ed1, ea85199)
-
-### Telos signs only what Telos owns
-The spot leg is the merchant's settlement, initiated by the payer on Tempo — observed for *gating* but not broadcast by Telos. The hedge is the only tx Telos signs. A bundler/Permit2 design that pulls tokens from the payer would change that scope.
-- **Why:** scope decisions about *who signs what* are architectural, not implementation details. They constrain the trust model and the regulatory surface.
-- **Where:** doc-comment on `SubmissionPlan` in `crates/telos-settler/src/lib.rs` (commit 138bdf2)
-
-### Mock interfaces for development
-`IHyperliquidGateway.placeShort` will never exist on real HL (HL routes through L1 actions via CoreWriter precompiles). For *simulation* the settler only needs a known selector to encode and a known event signature to detect. Real-HL plumbing comes later; this lets the rest of the architecture solidify first.
-- **Where:** `crates/telos-settler/src/abi.rs` (commit 03bc090)
+- `crates/telos-settler/src/lib.rs` — `SettlerDecision`, `RejectReason`, `should_submit` ([138bdf2](https://github.com/psyto/telos/commit/138bdf2))
+- `crates/telos-submitter/src/lib.rs` — `Submitter::new`, two-gate pattern, `assert_send_sync` ([138bdf2](https://github.com/psyto/telos/commit/138bdf2))
+- `crates/telos-cli/src/main.rs` — `TELOS_BROADCAST`, `TELOS_SIGNER_KEY`, `TELOS_SUBMIT_RPC_URL` ([138bdf2](https://github.com/psyto/telos/commit/138bdf2))
 
 ---
 
-## Chronological index
+## Week 8 — Closing the loop with confirmation
 
-| Week | Commit | Subject |
-|------|--------|---------|
-| 1 | [3ba07dd](https://github.com/psyto/telos/commit/3ba07dd) | Cargo workspace scaffold + Alloy block headers |
-| 1 | [b31d22e](https://github.com/psyto/telos/commit/b31d22e) | `sol!` macro + typed PaymentIntent subscription |
-| 2 | [ada0751](https://github.com/psyto/telos/commit/ada0751) | Multiplex Tempo + HL via `tokio::select!` |
-| 3 | [c983ed1](https://github.com/psyto/telos/commit/c983ed1) | REVM in-memory simulation harness |
-| 3 | [ea85199](https://github.com/psyto/telos/commit/ea85199) | Fork-from-RPC via `AlloyDB` + `WrapDatabaseAsync` |
-| 4 | [024e3e9](https://github.com/psyto/telos/commit/024e3e9) | `IERC20.transfer` calldata + revert decoding |
-| 5 | [85b5a14](https://github.com/psyto/telos/commit/85b5a14) | `PriceBook` feedback loop for hedge sizing |
-| 6 | [03bc090](https://github.com/psyto/telos/commit/03bc090) | Perp hedge as a second sequential leg |
-| 7 | [138bdf2](https://github.com/psyto/telos/commit/138bdf2) | `SettlerDecision` + dry-run-default `Submitter` |
-| 8 | [5a97014](https://github.com/psyto/telos/commit/5a97014) | `submit_and_confirm` + `SettlementResult` |
+**What you build.** Past the broadcast point: `submit_and_confirm`
+awaits the receipt under a `(confirmations, timeout)` budget, decodes
+the `OrderPlaced` event from the receipt logs, and returns a typed
+`SettlementResult`. The system now reports a terminal state for every
+intent it touches.
+
+**What you learn.**
+
+The Alloy confirmation pattern is the `PendingTransactionBuilder`:
+
+```rust
+pending
+    .with_required_confirmations(n)
+    .with_timeout(Some(d))
+    .get_receipt()
+    .await
+```
+
+Each builder method returns `Self`; `get_receipt()` consumes the
+chain. Policy lives in the builder, business logic stays clean.
+Tune `confirmations` per chain and per asset.
+
+EIP-658 added a `status` field to receipts: `true` = success, `false`
+= revert. Pre-Byzantium chains report by post-state hash instead, but
+Alloy abstracts that. Trust `receipt.status()`. Receipts do **not**
+carry revert data, only this bit + logs. To recover the revert
+*reason* from a failed receipt, you have to re-call `eth_call`
+against the same block — defer until you need it.
+
+The single most important API distinction in this commit is the
+shape of the return type. Submitter-level errors (invalid RPC URL,
+malformed signer key) propagate as `Result::Err`. Transaction-level
+outcomes (revert, timeout) come back as `Ok(SettlementResult::Failed
+| Timeout)`. **A revert is normal operation** — the system did its
+job, the chain rejected the tx. Forcing callers to `match
+err.downcast()` to handle expected outcomes is wrong. Bugs in
+`Result::Err`; outcomes in the success type.
+
+When two crates need the same ABI, promoting `mod abi` to `pub mod abi`
+gives you a single source of truth. Both the simulator and the
+submitter need to decode `OrderPlaced`. Duplicating the `sol!` block
+in the submitter would invite drift. Promoting the module is the
+cleanest way to share — though the abi module then becomes part of
+the crate's public surface, and breaking changes there ripple.
+
+**Where to look.**
+
+- `crates/telos-submitter/src/lib.rs` — `submit_and_confirm`, `ConfirmConfig` ([5a97014](https://github.com/psyto/telos/commit/5a97014))
+- `crates/telos-types/src/lib.rs` — `SettlementResult` enum ([5a97014](https://github.com/psyto/telos/commit/5a97014))
+- `crates/telos-settler/src/lib.rs` — `pub mod abi` ([5a97014](https://github.com/psyto/telos/commit/5a97014))
+
+---
+
+## Quick reference
+
+When you want to look something up rather than re-read the chapter.
+
+| Topic | Concept | Where |
+|---|---|---|
+| **Alloy** | `sol!` macro | abi.rs files |
+| **Alloy** | `From<GeneratedType> for DomainType` seam | listener/abi.rs |
+| **Alloy** | `Filter::new().address().event_signature()` | listener/lib.rs |
+| **Alloy** | `SolCall::abi_encode` | settler/lib.rs `build_spot_tx` |
+| **Alloy** | `Revert::abi_decode` (needs `SolError` in scope) | settler/lib.rs `decode_revert_reason` |
+| **Alloy** | Wallet-aware `ProviderBuilder` | submitter/lib.rs |
+| **Alloy** | `PendingTransactionBuilder` | submitter/lib.rs `submit_and_confirm` |
+| **Alloy** | `receipt.status()` (EIP-658) | submitter/lib.rs |
+| **REVM** | `Context::mainnet().with_db().build_mainnet()` | settler/lib.rs |
+| **REVM** | `tx_gas_used()` (EIP-8037 split) | settler/lib.rs `decode_leg` |
+| **REVM** | `ExecutionResult` sum type | settler/lib.rs `decode_outcome` |
+| **REVM** | Mutable `Context` across `transact` | settler/lib.rs `run_legs` |
+| **REVM** | Generic over `DB` | settler/lib.rs `run_legs<DB>` |
+| **REVM** | `alloydb` feature flag | Cargo.toml workspace |
+| **REVM** | `AlloyDB` + `WrapDatabaseAsync` + `spawn_blocking` + `Handle::enter()` | settler/lib.rs `simulate_settlement_forked` |
+| **Tokio** | `select!` cancel-safety | listener/lib.rs `watch_both` |
+| **Tokio** | Spawn rather than await in arms | listener/lib.rs `spawn_simulation` |
+| **Tokio** | `tokio::sync::RwLock` vs `std::sync::RwLock` | settler/lib.rs `PriceBook` |
+| **Tokio** | Errors vs outcomes in async APIs | submitter/lib.rs `submit_and_confirm` |
+| **Design** | Hide sync primitives behind a struct | settler/lib.rs `PriceBook` |
+| **Design** | Per-leg outcomes vs single boolean | settler/lib.rs `LegOutcome` |
+| **Design** | Sum type for decisions | settler/lib.rs `SettlerDecision` |
+| **Design** | `Option<T>` as soft failure | settler/lib.rs `quote_route` |
+| **Design** | Two gates for risky ops | submitter/lib.rs + cli/main.rs |
+| **Design** | Compile-time `Send + Sync` guard | submitter/lib.rs |
+| **Design** | Single source of truth for ABI | settler/lib.rs `pub mod abi` |
+| **Architecture** | Mode dispatch from env | cli/main.rs |
+| **Architecture** | Same-process feedback loop, no channels | listener + settler |
+| **Architecture** | Inline vs worker placement | listener/lib.rs `spawn_simulation` |
+| **Architecture** | Telos signs only what Telos owns | settler/lib.rs `SubmissionPlan` doc |
+| **Architecture** | Mock interfaces during development | settler/abi.rs `IHyperliquidGateway` |
