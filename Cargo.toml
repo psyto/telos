@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/telos-types",
     "crates/telos-listener",
+    "crates/telos-settler",
     "crates/telos-cli",
 ]
 
@@ -17,8 +18,10 @@ rust-version = "1.85"
 [workspace.dependencies]
 telos-types = { path = "crates/telos-types" }
 telos-listener = { path = "crates/telos-listener" }
+telos-settler = { path = "crates/telos-settler" }
 
 alloy = { version = "1.0", features = ["full"] }
+revm = "38"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

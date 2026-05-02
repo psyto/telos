@@ -151,6 +151,12 @@ fn handle_intent_log(log: &Log) {
                 deadline = intent.deadline,
                 "intent",
             );
+            // Run the simulation harness inline. Once the settler grows beyond
+            // microseconds we move it onto a dedicated worker, but at this
+            // stage the read loop is the right place — failures are visible.
+            if let Err(err) = telos_settler::simulate_settlement(&intent) {
+                warn!(target: "telos::listener", ?err, "simulation failed");
+            }
         }
         Err(err) => warn!(target: "telos::listener", ?err, "intent decode failed"),
     }

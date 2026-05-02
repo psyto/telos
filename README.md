@@ -81,7 +81,7 @@ telos/
 ├── crates/
 │   ├── telos-types/      # shared types: Intent, RouteQuote, etc.
 │   ├── telos-listener/   # Alloy-based event listener (Week 1–2)
-│   ├── telos-settler/    # REVM forked-state simulation (Week 3–4) [planned]
+│   ├── telos-settler/    # REVM simulation harness (Week 3, fork support next)
 │   ├── telos-precompile/ # Reth execution extension (Week 5–8) [planned]
 │   └── telos-cli/        # binary entry point
 └── Cargo.toml            # workspace
@@ -91,14 +91,11 @@ telos/
 
 ## Status
 
-Concept stage. As of 2026-05-03 the listener crate handles three modes:
+Concept stage. As of 2026-05-03:
 
-- **Headers** — bare WebSocket subscription, default when no contracts are set.
-- **Intents** — typed `PaymentIntent` filter on a Tempo contract address.
-- **Fills** — typed `Fill` filter on a Hyperliquid HyperEVM contract address.
-- **Both** — multiplexed via `tokio::select!` over two independent providers.
+**Listener** handles four modes — headers (default), typed `PaymentIntent` on a Tempo contract, typed `Fill` on a Hyperliquid HyperEVM contract, or both multiplexed via `tokio::select!`. Configure via env vars: `TELOS_TEMPO_WS_URL` + `TELOS_TEMPO_CONTRACT`, `TELOS_HL_WS_URL` + `TELOS_HL_CONTRACT`.
 
-Configure via env vars: `TELOS_TEMPO_WS_URL` + `TELOS_TEMPO_CONTRACT`, `TELOS_HL_WS_URL` + `TELOS_HL_CONTRACT`. Set both pairs to enter multiplex mode.
+**Settler** runs each decoded intent through an in-memory REVM and reports gas + success. Fork-from-RPC, contract calldata, and perp hedge sizing land in follow-up work — the API is fixed (`simulate_settlement(&intent)`) so callers can be wired now.
 
 This repository is private during the learning phase. It will open if and when the architecture stabilizes.
 
