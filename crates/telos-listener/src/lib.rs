@@ -51,6 +51,7 @@ pub async fn watch_intents(
     ws_url: &str,
     contract: Address,
     prices: PriceBook,
+    hedge_venue: Option<Address>,
     fork_url: Option<String>,
 ) -> Result<()> {
     let provider = ProviderBuilder::new().connect_ws(WsConnect::new(ws_url)).await?;
@@ -61,12 +62,13 @@ pub async fn watch_intents(
         url = %ws_url,
         contract = %contract,
         forked = fork_url.is_some(),
+        hedging = hedge_venue.is_some(),
         "subscribed to PaymentIntent logs",
     );
 
     while let Some(log) = stream.next().await {
         if let Some(intent) = decode_intent(&log) {
-            spawn_simulation(intent, prices.clone(), fork_url.clone());
+            spawn_simulation(intent, prices.clone(), hedge_venue, fork_url.clone());
         }
     }
 
@@ -101,6 +103,7 @@ pub async fn watch_both(
     hl_url: &str,
     hl_contract: Address,
     prices: PriceBook,
+    hedge_venue: Option<Address>,
     fork_url: Option<String>,
 ) -> Result<()> {
     let tempo = ProviderBuilder::new().connect_ws(WsConnect::new(tempo_url)).await?;
@@ -122,6 +125,7 @@ pub async fn watch_both(
         hl_url = %hl_url,
         hl_contract = %hl_contract,
         forked = fork_url.is_some(),
+        hedging = hedge_venue.is_some(),
         "multiplexing intent + fill streams",
     );
 
@@ -129,7 +133,7 @@ pub async fn watch_both(
         tokio::select! {
             Some(log) = intents.next() => {
                 if let Some(intent) = decode_intent(&log) {
-                    spawn_simulation(intent, prices.clone(), fork_url.clone());
+                    spawn_simulation(intent, prices.clone(), hedge_venue, fork_url.clone());
                 }
             }
             Some(log) = fills.next() => {
@@ -207,29 +211,53 @@ fn decode_fill(log: &Log) -> Option<Fill> {
 /// Quote the route, then dispatch the settler simulation onto its own task
 /// so the listener loop stays responsive. Forked simulations block on RPC
 /// fetches and would otherwise stall the next event.
-fn spawn_simulation(intent: PaymentIntent, prices: PriceBook, fork_url: Option<String>) {
+fn spawn_simulation(
+    intent: PaymentIntent,
+    prices: PriceBook,
+    hedge_venue: Option<Address>,
+    fork_url: Option<String>,
+) {
     tokio::spawn(async move {
-        match quote_route(&intent, &prices).await {
-            Some(route) => info!(
-                target: "telos::listener",
-                intent_id = %route.intent_id,
-                spot_amount = %route.spot_amount,
-                hedge_size = %route.hedge_size,
-                price_e8 = route.price_e8,
-                price_age_secs = route.price_age_secs,
-                "quoted",
-            ),
-            None => warn!(
-                target: "telos::listener",
-                intent_id = %intent.intent_id,
-                asset = %intent.settlement_asset,
-                "no price for asset — simulation will run without hedge sizing",
-            ),
-        }
+        let route = match hedge_venue {
+            Some(venue) => match quote_route(&intent, &prices, venue).await {
+                Some(r) => {
+                    info!(
+                        target: "telos::listener",
+                        intent_id = %r.intent_id,
+                        spot_amount = %r.spot_amount,
+                        hedge_size = %r.hedge_size,
+                        hedge_venue = %r.hedge_venue,
+                        price_e8 = r.price_e8,
+                        price_age_secs = r.price_age_secs,
+                        "quoted",
+                    );
+                    Some(r)
+                }
+                None => {
+                    warn!(
+                        target: "telos::listener",
+                        intent_id = %intent.intent_id,
+                        asset = %intent.settlement_asset,
+                        "no price for asset — running spot-only simulation",
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         let outcome = match fork_url {
-            Some(url) => simulate_settlement_forked(&intent, url, BlockId::latest()).await,
-            None => simulate_settlement(&intent),
+            Some(url) => {
+                simulate_settlement_forked(
+                    &intent,
+                    route,
+                    intent.max_slippage_bps,
+                    url,
+                    BlockId::latest(),
+                )
+                .await
+            }
+            None => simulate_settlement(&intent, route.as_ref(), intent.max_slippage_bps),
         };
         if let Err(err) = outcome {
             warn!(target: "telos::listener", ?err, "simulation failed");

@@ -95,11 +95,14 @@ Concept stage. As of 2026-05-03:
 
 **Listener** handles four modes — headers (default), typed `PaymentIntent` on a Tempo contract, typed `Fill` on a Hyperliquid HyperEVM contract, or both multiplexed via `tokio::select!`. Configure via env vars: `TELOS_TEMPO_WS_URL` + `TELOS_TEMPO_CONTRACT`, `TELOS_HL_WS_URL` + `TELOS_HL_CONTRACT`.
 
-**Settler** runs each decoded intent through REVM. The simulated tx is the payer's `IERC20.transfer(merchant, amount)` against the settlement asset (encoded via `sol!`). Two modes: empty in-memory state (`simulate_settlement`) or forked from a live RPC (`simulate_settlement_forked`, async, dispatched via `spawn_blocking` to bridge async Alloy ↔ sync REVM). Set `TELOS_TEMPO_FORK_URL` to enable forked mode.
+**Settler** runs each decoded intent through REVM in two sequential legs against the same EVM context — REVM's `transact` accumulates state, so the hedge tx sees the post-state of the spot tx.
 
-Outcomes capture success, gas used, decoded revert reason (`Error(string)`), and whether a matching `Transfer` event was emitted.
+- **Spot leg**: `IERC20.transfer(merchant, amount)` against the settlement asset.
+- **Hedge leg** (only when `TELOS_HL_GATEWAY` is set): `IHyperliquidGateway.placeShort(asset, size, maxSlippageBps)` against the configured HL builder/bridge address.
 
-**Feedback loop** (Week 5): a shared `PriceBook` is updated by every HL `Fill` and read by every decoded intent. `quote_route(intent, &prices)` returns a `RouteQuote` with spot amount and a 1:1 hedge size at the current mark — the placeholder that funding-tilt logic will replace. The `RouteQuote` is logged before each simulation runs.
+Both modes — empty in-memory state (`simulate_settlement`) and forked from a live RPC (`simulate_settlement_forked`, async, dispatched via `spawn_blocking` to bridge async Alloy ↔ sync REVM) — walk the same two-leg path. Outcomes carry per-leg success, gas, decoded revert reason, plus an `atomic_success` flag that is the AND of both legs.
+
+**Feedback loop**: a shared `PriceBook` is updated by every HL `Fill` and read by every decoded intent. `quote_route(intent, &prices, hedge_venue)` returns a `RouteQuote` with spot amount and a 1:1 hedge size at the current mark — the placeholder that funding-tilt logic will replace.
 
 This repository is private during the learning phase. It will open if and when the architecture stabilizes.
 

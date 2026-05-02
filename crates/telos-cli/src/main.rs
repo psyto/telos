@@ -10,14 +10,24 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env()?;
     let fork_url = cfg.fork_url.clone();
+    let hedge_venue = cfg.hedge_venue;
     let prices = PriceBook::new();
 
     match cfg.mode() {
         Mode::Both { tempo_url, tempo_contract, hl_url, hl_contract } => {
-            watch_both(&tempo_url, tempo_contract, &hl_url, hl_contract, prices, fork_url).await
+            watch_both(
+                &tempo_url,
+                tempo_contract,
+                &hl_url,
+                hl_contract,
+                prices,
+                hedge_venue,
+                fork_url,
+            )
+            .await
         }
         Mode::Intents { url, contract } => {
-            watch_intents(&url, contract, prices, fork_url).await
+            watch_intents(&url, contract, prices, hedge_venue, fork_url).await
         }
         Mode::Fills { url, contract } => watch_fills(&url, contract, prices).await,
         Mode::Headers { url } => watch_headers(&url).await,
@@ -31,6 +41,7 @@ struct Config {
     hl_url: Option<String>,
     hl_contract: Option<Address>,
     fork_url: Option<String>,
+    hedge_venue: Option<Address>,
 }
 
 enum Mode {
@@ -55,6 +66,7 @@ impl Config {
             hl_url: std::env::var("TELOS_HL_WS_URL").ok(),
             hl_contract: parse_addr("TELOS_HL_CONTRACT")?,
             fork_url: std::env::var("TELOS_TEMPO_FORK_URL").ok(),
+            hedge_venue: parse_addr("TELOS_HL_GATEWAY")?,
         })
     }
 

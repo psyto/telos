@@ -61,6 +61,7 @@ pub struct RouteQuote {
     pub spot_asset: Address,
     pub spot_amount: U256,
     pub hedge_size: U256,
+    pub hedge_venue: Address,
     pub price_e8: u64,
     pub price_age_secs: u64,
 }

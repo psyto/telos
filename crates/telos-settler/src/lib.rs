@@ -1,11 +1,17 @@
-//! Telos settler — Week 3–4 simulation harness.
+//! Telos settler — Week 3–6 simulation harness.
 //!
 //! Two flavors:
 //!   - [`simulate_settlement`] runs against an empty in-memory state. Cheap
 //!     and synchronous, useful for proving the harness wiring is alive.
 //!   - [`simulate_settlement_forked`] forks a live RPC at a chosen block via
-//!     `AlloyDB`. Now exercises real account state — the simulated tx is the
-//!     payer's `transfer(merchant, amount)` against the settlement asset.
+//!     `AlloyDB`. Exercises real account state, balances, and bytecode.
+//!
+//! Both walk the same two legs in sequence: the payer's
+//! `IERC20.transfer(merchant, amount)` against the settlement asset, then —
+//! if a [`RouteQuote`] is supplied — `IHyperliquidGateway.placeShort(...)`
+//! for the perp hedge. REVM's `Context` accumulates state between
+//! `transact` calls, so the second leg sees the post-state of the first.
+//! `atomic_success` is the AND of both legs (or just spot when no quote).
 //!
 //! Bridging async (Alloy) to sync (REVM): `AlloyDB`'s state-fetch is async,
 //! REVM's `Database` trait is sync. `WrapDatabaseAsync` calls `block_on` on
@@ -15,7 +21,7 @@
 
 mod abi;
 
-use abi::IERC20;
+use abi::{IERC20, IHyperliquidGateway};
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes};
 use alloy::providers::ProviderBuilder;
@@ -35,22 +41,27 @@ use telos_types::{Fill, PaymentIntent, PriceQuote, PriceSource, RouteQuote};
 use tokio::sync::RwLock;
 use tracing::info;
 
-/// What the settler decides about a candidate route, before any tx is sent.
+/// Per-leg result. The settler reports both legs independently so the caller
+/// can see *which* leg blocked atomic settlement.
 #[derive(Debug, Clone)]
-pub struct SimulationOutcome {
+pub struct LegOutcome {
     pub success: bool,
     pub gas_used: u64,
-    /// Decoded `Error(string)` reason if the tx reverted with one.
     pub revert_reason: Option<String>,
-    /// True if a matching ERC-20 `Transfer` event was emitted to the merchant.
+}
+
+/// Combined two-leg simulation result. `atomic_success` is the AND of both
+/// legs (or just `spot` when no `RouteQuote` was supplied).
+#[derive(Debug, Clone)]
+pub struct SimulationOutcome {
+    pub spot: LegOutcome,
+    pub hedge: Option<LegOutcome>,
     pub transfer_emitted: bool,
+    pub hedge_acked: bool,
+    pub atomic_success: bool,
 }
 
 /// Shared, async-safe map from spot asset to its most recent observed price.
-///
-/// The fill watcher is the writer; the intent simulator is the reader. Hidden
-/// behind a struct rather than exposed as a type alias so the lock semantics
-/// stay encapsulated and the public API is just `record` and `get`.
 #[derive(Clone, Default)]
 pub struct PriceBook {
     inner: Arc<RwLock<HashMap<Address, PriceQuote>>>,
@@ -62,8 +73,6 @@ impl PriceBook {
     }
 
     /// Update the book from a Hyperliquid fill — last trade is taken as the mark.
-    /// A more honest mark would weight recent buys/sells or use orderbook mid;
-    /// good enough for Week 5.
     pub async fn record_fill(&self, fill: &Fill) {
         let quote = PriceQuote {
             asset: fill.asset,
@@ -80,11 +89,11 @@ impl PriceBook {
 }
 
 /// Size the spot + perp legs for an intent against the current price book.
-///
-/// Returns `None` if no price has been observed yet for the settlement asset —
-/// the listener will log a warning and skip the simulation. 1:1 hedge sizing
-/// is the placeholder; tilt logic lands once we have funding-rate data.
-pub async fn quote_route(intent: &PaymentIntent, prices: &PriceBook) -> Option<RouteQuote> {
+pub async fn quote_route(
+    intent: &PaymentIntent,
+    prices: &PriceBook,
+    hedge_venue: Address,
+) -> Option<RouteQuote> {
     let quote = prices.get(intent.settlement_asset).await?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
 
@@ -93,39 +102,29 @@ pub async fn quote_route(intent: &PaymentIntent, prices: &PriceBook) -> Option<R
         spot_asset: intent.settlement_asset,
         spot_amount: intent.settlement_amount,
         hedge_size: intent.settlement_amount,
+        hedge_venue,
         price_e8: quote.price_e8,
         price_age_secs: now.saturating_sub(quote.timestamp),
     })
 }
 
-/// Replay the merchant settlement transfer against an empty in-memory state.
-///
-/// With empty state the payer has no token balance, so this will revert.
-/// That's the point — the harness exercises the *failure path* end-to-end.
-pub fn simulate_settlement(intent: &PaymentIntent) -> Result<SimulationOutcome> {
+/// Replay both legs against an empty in-memory state.
+pub fn simulate_settlement(
+    intent: &PaymentIntent,
+    route: Option<&RouteQuote>,
+    intent_max_slippage_bps: u16,
+) -> Result<SimulationOutcome> {
     let mut evm = Context::mainnet()
         .with_db(CacheDB::<EmptyDB>::default())
         .build_mainnet();
-
-    let result = evm.transact(build_tx(intent))?.result;
-    let outcome = decode_outcome(&result, intent);
-
-    info!(
-        target: "telos::settler",
-        intent_id = %intent.intent_id,
-        success = outcome.success,
-        gas_used = outcome.gas_used,
-        revert = ?outcome.revert_reason,
-        transfer = outcome.transfer_emitted,
-        "simulated (empty state)",
-    );
-
-    Ok(outcome)
+    run_legs(&mut evm, intent, route, intent_max_slippage_bps, "empty state")
 }
 
-/// Replay the same tx against forked state pulled from a live RPC.
+/// Replay both legs against forked state pulled from a live RPC.
 pub async fn simulate_settlement_forked(
     intent: &PaymentIntent,
+    route: Option<RouteQuote>,
+    intent_max_slippage_bps: u16,
     rpc_url: String,
     block: BlockId,
 ) -> Result<SimulationOutcome> {
@@ -133,9 +132,6 @@ pub async fn simulate_settlement_forked(
     let handle = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || -> Result<SimulationOutcome> {
-        // Re-enter the parent runtime so WrapDatabaseAsync can find a Handle
-        // and submit async state fetches to it. Without `_enter`, the blocking
-        // thread has no current runtime and `WrapDatabaseAsync::new` returns None.
         let _enter = handle.enter();
 
         let url = rpc_url.parse()?;
@@ -146,30 +142,73 @@ pub async fn simulate_settlement_forked(
         let db = CacheDB::new(wrapped);
 
         let mut evm = Context::mainnet().with_db(db).build_mainnet();
-        let result = evm.transact(build_tx(&intent))?.result;
-        let outcome = decode_outcome(&result, &intent);
-
-        info!(
-            target: "telos::settler",
-            intent_id = %intent.intent_id,
-            success = outcome.success,
-            gas_used = outcome.gas_used,
-            revert = ?outcome.revert_reason,
-            transfer = outcome.transfer_emitted,
-            "simulated (forked)",
-        );
-
-        Ok(outcome)
+        run_legs(&mut evm, &intent, route.as_ref(), intent_max_slippage_bps, "forked")
     })
     .await
     .map_err(|e| eyre!("settler task panicked: {e}"))?
 }
 
-/// Build a `transfer(merchant, amount)` call against the settlement asset.
+/// Walk both legs in order against whichever EVM context the caller built.
 ///
-/// The selector + ABI-encoded args go in `data`; `kind` targets the token
-/// contract (not the merchant), since ERC-20 transfers are contract calls.
-fn build_tx(intent: &PaymentIntent) -> TxEnv {
+/// Generic over the database type so the empty-state and forked paths share
+/// this code. `transact` mutates the EVM in place — the hedge tx sees any
+/// nonce/balance/storage changes the spot tx made.
+fn run_legs<DB>(
+    evm: &mut revm::MainnetEvm<Context<revm::context::BlockEnv, TxEnv, revm::context::CfgEnv, DB>>,
+    intent: &PaymentIntent,
+    route: Option<&RouteQuote>,
+    intent_max_slippage_bps: u16,
+    label: &str,
+) -> Result<SimulationOutcome>
+where
+    DB: revm::database_interface::Database,
+    <DB as revm::database_interface::Database>::Error: std::error::Error + Send + Sync + 'static,
+{
+    let spot_result = evm.transact(build_spot_tx(intent))?.result;
+    let spot = decode_leg(&spot_result);
+    let transfer_emitted = scan_transfer_event(&spot_result, intent.payer, intent.merchant);
+
+    let (hedge, hedge_acked) = match route {
+        Some(r) => {
+            let hedge_result = evm
+                .transact(build_hedge_tx(intent.payer, r, intent_max_slippage_bps))?
+                .result;
+            let acked = scan_order_placed_event(&hedge_result, r.spot_asset);
+            (Some(decode_leg(&hedge_result)), acked)
+        }
+        None => (None, false),
+    };
+
+    let atomic_success = spot.success && hedge.as_ref().map(|h| h.success).unwrap_or(true);
+
+    let outcome = SimulationOutcome {
+        spot,
+        hedge,
+        transfer_emitted,
+        hedge_acked,
+        atomic_success,
+    };
+
+    info!(
+        target: "telos::settler",
+        intent_id = %intent.intent_id,
+        atomic = outcome.atomic_success,
+        spot_success = outcome.spot.success,
+        spot_revert = ?outcome.spot.revert_reason,
+        spot_gas = outcome.spot.gas_used,
+        transfer = outcome.transfer_emitted,
+        hedge_success = ?outcome.hedge.as_ref().map(|h| h.success),
+        hedge_revert = ?outcome.hedge.as_ref().and_then(|h| h.revert_reason.clone()),
+        hedge_gas = ?outcome.hedge.as_ref().map(|h| h.gas_used),
+        hedge_acked = outcome.hedge_acked,
+        mode = label,
+        "simulated",
+    );
+
+    Ok(outcome)
+}
+
+fn build_spot_tx(intent: &PaymentIntent) -> TxEnv {
     let calldata = IERC20::transferCall {
         to: intent.merchant,
         amount: intent.settlement_amount,
@@ -187,36 +226,61 @@ fn build_tx(intent: &PaymentIntent) -> TxEnv {
     }
 }
 
-fn decode_outcome(
-    result: &ExecutionResult,
-    intent: &PaymentIntent,
-) -> SimulationOutcome {
-    let success = result.is_success();
-    let gas_used = result.tx_gas_used();
+fn build_hedge_tx(payer: Address, route: &RouteQuote, max_slippage_bps: u16) -> TxEnv {
+    let calldata = IHyperliquidGateway::placeShortCall {
+        asset: route.spot_asset,
+        size: route.hedge_size,
+        maxSlippageBps: max_slippage_bps,
+    }
+    .abi_encode();
 
-    let revert_reason = match result {
-        ExecutionResult::Revert { output, .. } => decode_revert_reason(output),
-        _ => None,
-    };
+    TxEnv {
+        caller: payer,
+        kind: TxKind::Call(route.hedge_venue),
+        value: U256::ZERO,
+        data: Bytes::from(calldata),
+        gas_limit: 300_000,
+        gas_price: 0,
+        ..Default::default()
+    }
+}
 
-    let transfer_emitted = match result {
-        ExecutionResult::Success { output: Output::Call(_), logs, .. } => logs
-            .iter()
-            .any(|log| match IERC20::Transfer::decode_log(log) {
-                Ok(t) => t.from == intent.payer && t.to == intent.merchant,
+fn decode_leg(result: &ExecutionResult) -> LegOutcome {
+    LegOutcome {
+        success: result.is_success(),
+        gas_used: result.tx_gas_used(),
+        revert_reason: match result {
+            ExecutionResult::Revert { output, .. } => decode_revert_reason(output),
+            _ => None,
+        },
+    }
+}
+
+fn scan_transfer_event(result: &ExecutionResult, from: Address, to: Address) -> bool {
+    match result {
+        ExecutionResult::Success { output: Output::Call(_), logs, .. } => {
+            logs.iter().any(|log| match IERC20::Transfer::decode_log(log) {
+                Ok(t) => t.from == from && t.to == to,
                 Err(_) => false,
-            }),
+            })
+        }
         _ => false,
-    };
+    }
+}
 
-    SimulationOutcome { success, gas_used, revert_reason, transfer_emitted }
+fn scan_order_placed_event(result: &ExecutionResult, asset: Address) -> bool {
+    match result {
+        ExecutionResult::Success { logs, .. } => {
+            logs.iter().any(|log| match IHyperliquidGateway::OrderPlaced::decode_log(log) {
+                Ok(o) => o.asset == asset,
+                Err(_) => false,
+            })
+        }
+        _ => false,
+    }
 }
 
 /// Decode standard `Error(string)` revert payloads.
-///
-/// Custom errors and `Panic(uint256)` would each need their own selector
-/// match; here we only handle the plain-string case since that's what
-/// OpenZeppelin's ERC-20 emits ("ERC20: transfer amount exceeds balance").
 fn decode_revert_reason(output: &Bytes) -> Option<String> {
     let revert = alloy::sol_types::Revert::abi_decode(output).ok()?;
     Some(revert.reason)
