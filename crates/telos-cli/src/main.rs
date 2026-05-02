@@ -1,6 +1,7 @@
 use alloy::primitives::Address;
 use eyre::{Result, WrapErr};
 use telos_listener::{watch_both, watch_fills, watch_headers, watch_intents};
+use telos_settler::PriceBook;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -9,13 +10,16 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env()?;
     let fork_url = cfg.fork_url.clone();
+    let prices = PriceBook::new();
 
     match cfg.mode() {
         Mode::Both { tempo_url, tempo_contract, hl_url, hl_contract } => {
-            watch_both(&tempo_url, tempo_contract, &hl_url, hl_contract, fork_url).await
+            watch_both(&tempo_url, tempo_contract, &hl_url, hl_contract, prices, fork_url).await
         }
-        Mode::Intents { url, contract } => watch_intents(&url, contract, fork_url).await,
-        Mode::Fills { url, contract } => watch_fills(&url, contract).await,
+        Mode::Intents { url, contract } => {
+            watch_intents(&url, contract, prices, fork_url).await
+        }
+        Mode::Fills { url, contract } => watch_fills(&url, contract, prices).await,
         Mode::Headers { url } => watch_headers(&url).await,
     }
 }

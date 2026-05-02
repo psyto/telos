@@ -24,10 +24,13 @@ sol! {
 
     /// Emitted by a Hyperliquid HyperEVM bridge or builder contract when a spot
     /// fill is reported back from L1. Fields use HL's native 1e8 fixed-point.
+    /// `asset` is the EVM-side address of the spot token; the settler uses it
+    /// to key its price book.
     #[derive(Debug)]
     event Fill(
         address indexed trader,
         bytes32 indexed orderId,
+        address indexed asset,
         bool isBuy,
         uint64 priceE8,
         uint64 sizeE8,
@@ -54,6 +57,7 @@ impl From<Fill> for telos_types::Fill {
         Self {
             trader: ev.trader,
             order_id: ev.orderId,
+            asset: ev.asset,
             is_buy: ev.isBuy,
             price_e8: ev.priceE8,
             size_e8: ev.sizeE8,

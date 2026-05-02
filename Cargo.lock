@@ -4325,6 +4325,7 @@ dependencies = [
  "alloy",
  "eyre",
  "telos-listener",
+ "telos-settler",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
