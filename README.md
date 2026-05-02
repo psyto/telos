@@ -91,7 +91,14 @@ telos/
 
 ## Status
 
-Concept stage as of 2026-05-02. Week 1 listener skeleton in progress.
+Concept stage. As of 2026-05-03 the listener crate handles three modes:
+
+- **Headers** — bare WebSocket subscription, default when no contracts are set.
+- **Intents** — typed `PaymentIntent` filter on a Tempo contract address.
+- **Fills** — typed `Fill` filter on a Hyperliquid HyperEVM contract address.
+- **Both** — multiplexed via `tokio::select!` over two independent providers.
+
+Configure via env vars: `TELOS_TEMPO_WS_URL` + `TELOS_TEMPO_CONTRACT`, `TELOS_HL_WS_URL` + `TELOS_HL_CONTRACT`. Set both pairs to enter multiplex mode.
 
 This repository is private during the learning phase. It will open if and when the architecture stabilizes.
 

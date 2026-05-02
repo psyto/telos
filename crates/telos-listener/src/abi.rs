@@ -21,6 +21,18 @@ sol! {
         uint16 maxSlippageBps,
         uint64 deadline
     );
+
+    /// Emitted by a Hyperliquid HyperEVM bridge or builder contract when a spot
+    /// fill is reported back from L1. Fields use HL's native 1e8 fixed-point.
+    #[derive(Debug)]
+    event Fill(
+        address indexed trader,
+        bytes32 indexed orderId,
+        bool isBuy,
+        uint64 priceE8,
+        uint64 sizeE8,
+        uint64 timestamp
+    );
 }
 
 impl From<PaymentIntent> for telos_types::PaymentIntent {
@@ -33,6 +45,19 @@ impl From<PaymentIntent> for telos_types::PaymentIntent {
             settlement_amount: ev.settlementAmount,
             max_slippage_bps: ev.maxSlippageBps,
             deadline: ev.deadline,
+        }
+    }
+}
+
+impl From<Fill> for telos_types::Fill {
+    fn from(ev: Fill) -> Self {
+        Self {
+            trader: ev.trader,
+            order_id: ev.orderId,
+            is_buy: ev.isBuy,
+            price_e8: ev.priceE8,
+            size_e8: ev.sizeE8,
+            timestamp: ev.timestamp,
         }
     }
 }

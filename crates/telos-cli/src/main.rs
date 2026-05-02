@@ -1,23 +1,85 @@
 use alloy::primitives::Address;
 use eyre::{Result, WrapErr};
-use telos_listener::{watch_headers, watch_intents};
+use telos_listener::{watch_both, watch_fills, watch_headers, watch_intents};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
-    let ws_url = std::env::var("TELOS_WS_URL")
-        .unwrap_or_else(|_| "wss://ethereum-rpc.publicnode.com".to_string());
+    let cfg = Config::from_env()?;
 
-    match std::env::var("TELOS_INTENT_CONTRACT").ok() {
-        Some(addr) => {
-            let contract: Address = addr
-                .parse()
-                .wrap_err("TELOS_INTENT_CONTRACT must be a hex address")?;
-            watch_intents(&ws_url, contract).await
+    match cfg.mode() {
+        Mode::Both { tempo_url, tempo_contract, hl_url, hl_contract } => {
+            watch_both(&tempo_url, tempo_contract, &hl_url, hl_contract).await
         }
-        None => watch_headers(&ws_url).await,
+        Mode::Intents { url, contract } => watch_intents(&url, contract).await,
+        Mode::Fills { url, contract } => watch_fills(&url, contract).await,
+        Mode::Headers { url } => watch_headers(&url).await,
+    }
+}
+
+struct Config {
+    fallback_url: String,
+    tempo_url: Option<String>,
+    tempo_contract: Option<Address>,
+    hl_url: Option<String>,
+    hl_contract: Option<Address>,
+}
+
+enum Mode {
+    Headers { url: String },
+    Intents { url: String, contract: Address },
+    Fills { url: String, contract: Address },
+    Both {
+        tempo_url: String,
+        tempo_contract: Address,
+        hl_url: String,
+        hl_contract: Address,
+    },
+}
+
+impl Config {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            fallback_url: std::env::var("TELOS_WS_URL")
+                .unwrap_or_else(|_| "wss://ethereum-rpc.publicnode.com".to_string()),
+            tempo_url: std::env::var("TELOS_TEMPO_WS_URL").ok(),
+            tempo_contract: parse_addr("TELOS_TEMPO_CONTRACT")?,
+            hl_url: std::env::var("TELOS_HL_WS_URL").ok(),
+            hl_contract: parse_addr("TELOS_HL_CONTRACT")?,
+        })
+    }
+
+    fn mode(self) -> Mode {
+        let tempo = self.tempo_contract.map(|c| {
+            (
+                self.tempo_url.clone().unwrap_or_else(|| self.fallback_url.clone()),
+                c,
+            )
+        });
+        let hl = self
+            .hl_contract
+            .map(|c| (self.hl_url.clone().unwrap_or_else(|| self.fallback_url.clone()), c));
+
+        match (tempo, hl) {
+            (Some((tempo_url, tempo_contract)), Some((hl_url, hl_contract))) => Mode::Both {
+                tempo_url,
+                tempo_contract,
+                hl_url,
+                hl_contract,
+            },
+            (Some((url, contract)), None) => Mode::Intents { url, contract },
+            (None, Some((url, contract))) => Mode::Fills { url, contract },
+            (None, None) => Mode::Headers { url: self.fallback_url },
+        }
+    }
+}
+
+fn parse_addr(var: &str) -> Result<Option<Address>> {
+    match std::env::var(var) {
+        Ok(s) => Ok(Some(s.parse().wrap_err_with(|| format!("{var} must be a hex address"))?)),
+        Err(_) => Ok(None),
     }
 }
 
