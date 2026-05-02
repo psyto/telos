@@ -26,7 +26,7 @@ use telos_settler::{
     PriceBook, SettlerDecision, SubmitConfig, quote_route, should_submit, simulate_settlement,
     simulate_settlement_forked,
 };
-use telos_submitter::Submitter;
+use telos_submitter::{ConfirmConfig, Submitter};
 use telos_types::{Fill, PaymentIntent};
 use tracing::{info, warn};
 
@@ -293,11 +293,20 @@ fn spawn_simulation(
         let decision = should_submit(&outcome, route.as_ref(), &intent, &SubmitConfig::default());
         match decision {
             SettlerDecision::Submit(plan) => match submitter.as_ref() {
-                Some(s) => {
-                    if let Err(err) = s.submit(&plan).await {
-                        warn!(target: "telos::listener", ?err, intent_id = %intent.intent_id, "submit failed");
-                    }
-                }
+                Some(s) => match s.submit_and_confirm(&plan, ConfirmConfig::default()).await {
+                    Ok(result) => info!(
+                        target: "telos::listener",
+                        intent_id = %intent.intent_id,
+                        ?result,
+                        "settled",
+                    ),
+                    Err(err) => warn!(
+                        target: "telos::listener",
+                        ?err,
+                        intent_id = %intent.intent_id,
+                        "submit failed",
+                    ),
+                },
                 None => info!(
                     target: "telos::listener",
                     intent_id = %plan.intent_id,

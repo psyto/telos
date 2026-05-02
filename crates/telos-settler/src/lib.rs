@@ -19,7 +19,7 @@
 //! the simulation onto a `spawn_blocking` thread and pass the parent
 //! runtime's `Handle` so the wrapped DB can submit fetches back to it.
 
-mod abi;
+pub mod abi;
 
 use abi::{IERC20, IHyperliquidGateway};
 use alloy::eips::BlockId;

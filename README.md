@@ -107,7 +107,9 @@ Both modes — empty in-memory state (`simulate_settlement`) and forked from a l
 
 **Decision gate**: `should_submit(outcome, route, intent, cfg)` returns `Submit(SubmissionPlan)` or `Reject(reason)` — rejecting on no quote, spot or hedge revert, or stale price (`max_price_age_secs` defaults to 30).
 
-**Submitter** (Week 7): when approved, the hedge tx is handed to a `Submitter` backed by an Alloy wallet-aware provider. **Dry-run by default**: estimates gas and logs the intended broadcast. Set `TELOS_BROADCAST=1` *and* provide `TELOS_SIGNER_KEY` + `TELOS_SUBMIT_RPC_URL` to actually broadcast. Telos signs only the hedge — the spot leg is the merchant's settlement, observed for gating but not broadcast by us.
+**Submitter** (Weeks 7–8): when approved, the hedge tx is handed to a `Submitter` backed by an Alloy wallet-aware provider. **Dry-run by default**: estimates gas and logs the intended broadcast. Set `TELOS_BROADCAST=1` *and* provide `TELOS_SIGNER_KEY` + `TELOS_SUBMIT_RPC_URL` to actually broadcast. Telos signs only the hedge — the spot leg is the merchant's settlement, observed for gating but not broadcast by us.
+
+After broadcast, `submit_and_confirm` awaits the receipt under a `ConfirmConfig { confirmations, timeout }` budget and decodes any emitted `OrderPlaced` event from the receipt logs. Returns a typed `SettlementResult`: `DryRun`, `Confirmed { tx_hash, block_number, gas_used, hedge_acked }`, `Failed { ... }` (mined but reverted), or `Timeout { waited_secs }`.
 
 This repository is private during the learning phase. It will open if and when the architecture stabilizes.
 

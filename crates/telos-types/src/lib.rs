@@ -65,3 +65,36 @@ pub struct RouteQuote {
     pub price_e8: u64,
     pub price_age_secs: u64,
 }
+
+/// What eventually happened to a hedge tx.
+///
+/// `DryRun` means the submitter was in safety mode — gas was estimated but
+/// nothing was sent. `Confirmed` means the receipt landed and the
+/// `OrderPlaced` event we wanted was emitted. `Failed` means the tx mined
+/// but reverted (the receipt's `status == 0`); `Timeout` means we never
+/// observed a receipt within the budget. The four cases cover every
+/// outcome a single submission can have.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SettlementResult {
+    DryRun {
+        intent_id: B256,
+        estimated_gas: u64,
+    },
+    Confirmed {
+        intent_id: B256,
+        tx_hash: B256,
+        block_number: u64,
+        gas_used: u64,
+        hedge_acked: bool,
+    },
+    Failed {
+        intent_id: B256,
+        tx_hash: B256,
+        block_number: u64,
+    },
+    Timeout {
+        intent_id: B256,
+        tx_hash: B256,
+        waited_secs: u64,
+    },
+}

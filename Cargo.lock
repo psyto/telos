@@ -4365,6 +4365,7 @@ dependencies = [
  "alloy",
  "eyre",
  "telos-settler",
+ "telos-types",
  "tokio",
  "tracing",
 ]
