@@ -1,0 +1,18 @@
+[package]
+name = "telos-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "telos"
+path = "src/main.rs"
+
+[dependencies]
+telos-listener = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+eyre = { workspace = true }
