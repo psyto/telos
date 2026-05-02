@@ -6,6 +6,8 @@
 
 This is a **research project**, not yet a product. It is also the practical companion to [psyto/rethlab](https://github.com/psyto/rethlab): RethLab teaches the Rust EVM stack from source; Telos puts it into production.
 
+A running list of concepts internalized while building Telos lives in [LEARNING.md](./LEARNING.md), organized by topic with pointers back to the commits that introduced them.
+
 ---
 
 ## The novel primitive: spot-settle + perp-hedge
