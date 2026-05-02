@@ -22,7 +22,11 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use eyre::Result;
 use futures_util::StreamExt;
-use telos_settler::{PriceBook, quote_route, simulate_settlement, simulate_settlement_forked};
+use telos_settler::{
+    PriceBook, SettlerDecision, SubmitConfig, quote_route, should_submit, simulate_settlement,
+    simulate_settlement_forked,
+};
+use telos_submitter::Submitter;
 use telos_types::{Fill, PaymentIntent};
 use tracing::{info, warn};
 
@@ -53,6 +57,7 @@ pub async fn watch_intents(
     prices: PriceBook,
     hedge_venue: Option<Address>,
     fork_url: Option<String>,
+    submitter: Option<Submitter>,
 ) -> Result<()> {
     let provider = ProviderBuilder::new().connect_ws(WsConnect::new(ws_url)).await?;
     let mut stream = provider.subscribe_logs(&intent_filter(contract)).await?.into_stream();
@@ -63,12 +68,19 @@ pub async fn watch_intents(
         contract = %contract,
         forked = fork_url.is_some(),
         hedging = hedge_venue.is_some(),
+        submitting = submitter.is_some(),
         "subscribed to PaymentIntent logs",
     );
 
     while let Some(log) = stream.next().await {
         if let Some(intent) = decode_intent(&log) {
-            spawn_simulation(intent, prices.clone(), hedge_venue, fork_url.clone());
+            spawn_simulation(
+                intent,
+                prices.clone(),
+                hedge_venue,
+                fork_url.clone(),
+                submitter.clone(),
+            );
         }
     }
 
@@ -97,6 +109,7 @@ pub async fn watch_fills(ws_url: &str, contract: Address, prices: PriceBook) -> 
 }
 
 /// Multiplex Tempo intents and HL fills over two independent WebSocket providers.
+#[allow(clippy::too_many_arguments)]
 pub async fn watch_both(
     tempo_url: &str,
     tempo_contract: Address,
@@ -105,6 +118,7 @@ pub async fn watch_both(
     prices: PriceBook,
     hedge_venue: Option<Address>,
     fork_url: Option<String>,
+    submitter: Option<Submitter>,
 ) -> Result<()> {
     let tempo = ProviderBuilder::new().connect_ws(WsConnect::new(tempo_url)).await?;
     let hl = ProviderBuilder::new().connect_ws(WsConnect::new(hl_url)).await?;
@@ -126,6 +140,7 @@ pub async fn watch_both(
         hl_contract = %hl_contract,
         forked = fork_url.is_some(),
         hedging = hedge_venue.is_some(),
+        submitting = submitter.is_some(),
         "multiplexing intent + fill streams",
     );
 
@@ -133,7 +148,13 @@ pub async fn watch_both(
         tokio::select! {
             Some(log) = intents.next() => {
                 if let Some(intent) = decode_intent(&log) {
-                    spawn_simulation(intent, prices.clone(), hedge_venue, fork_url.clone());
+                    spawn_simulation(
+                        intent,
+                        prices.clone(),
+                        hedge_venue,
+                        fork_url.clone(),
+                        submitter.clone(),
+                    );
                 }
             }
             Some(log) = fills.next() => {
@@ -208,14 +229,15 @@ fn decode_fill(log: &Log) -> Option<Fill> {
     }
 }
 
-/// Quote the route, then dispatch the settler simulation onto its own task
-/// so the listener loop stays responsive. Forked simulations block on RPC
-/// fetches and would otherwise stall the next event.
+/// Quote the route, dispatch the settler simulation, gate on the outcome,
+/// and hand the plan to the submitter when approved. All on a spawned task
+/// so the listener loop stays responsive — forked sims block on RPC fetches.
 fn spawn_simulation(
     intent: PaymentIntent,
     prices: PriceBook,
     hedge_venue: Option<Address>,
     fork_url: Option<String>,
+    submitter: Option<Submitter>,
 ) {
     tokio::spawn(async move {
         let route = match hedge_venue {
@@ -250,7 +272,7 @@ fn spawn_simulation(
             Some(url) => {
                 simulate_settlement_forked(
                     &intent,
-                    route,
+                    route.clone(),
                     intent.max_slippage_bps,
                     url,
                     BlockId::latest(),
@@ -259,8 +281,36 @@ fn spawn_simulation(
             }
             None => simulate_settlement(&intent, route.as_ref(), intent.max_slippage_bps),
         };
-        if let Err(err) = outcome {
-            warn!(target: "telos::listener", ?err, "simulation failed");
+
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(err) => {
+                warn!(target: "telos::listener", ?err, "simulation failed");
+                return;
+            }
+        };
+
+        let decision = should_submit(&outcome, route.as_ref(), &intent, &SubmitConfig::default());
+        match decision {
+            SettlerDecision::Submit(plan) => match submitter.as_ref() {
+                Some(s) => {
+                    if let Err(err) = s.submit(&plan).await {
+                        warn!(target: "telos::listener", ?err, intent_id = %intent.intent_id, "submit failed");
+                    }
+                }
+                None => info!(
+                    target: "telos::listener",
+                    intent_id = %plan.intent_id,
+                    hedge_to = %plan.hedge.to,
+                    "approved but no submitter configured",
+                ),
+            },
+            SettlerDecision::Reject(reason) => info!(
+                target: "telos::listener",
+                intent_id = %intent.intent_id,
+                ?reason,
+                "rejected",
+            ),
         }
     });
 }

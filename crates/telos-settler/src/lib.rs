@@ -61,6 +61,113 @@ pub struct SimulationOutcome {
     pub atomic_success: bool,
 }
 
+/// One transaction the submitter would broadcast on Telos's behalf.
+/// Only `to`, `data`, and `gas_limit` are decided here; the submitter fills
+/// nonce, gas price, and chain id.
+#[derive(Debug, Clone)]
+pub struct PreparedTx {
+    pub to: Address,
+    pub data: Bytes,
+    pub gas_limit: u64,
+}
+
+/// What the submitter receives. Telos only signs the hedge — the spot leg
+/// is the merchant's settlement, initiated by the payer on Tempo, observed
+/// here for *gating* but not broadcast by us. A bundler/Permit2 design
+/// would change that; deferred.
+#[derive(Debug, Clone)]
+pub struct SubmissionPlan {
+    pub intent_id: alloy::primitives::B256,
+    pub hedge: PreparedTx,
+}
+
+#[derive(Debug, Clone)]
+pub enum SettlerDecision {
+    Submit(SubmissionPlan),
+    Reject(RejectReason),
+}
+
+#[derive(Debug, Clone)]
+pub enum RejectReason {
+    NoQuote,
+    SpotWouldRevert(Option<String>),
+    HedgeWouldRevert(Option<String>),
+    PriceTooStale { age_secs: u64, max_secs: u64 },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SubmitConfig {
+    pub max_price_age_secs: u64,
+}
+
+impl Default for SubmitConfig {
+    fn default() -> Self {
+        Self { max_price_age_secs: 30 }
+    }
+}
+
+/// Gate broadcast on the simulation outcome and quote freshness.
+///
+/// Reject if:
+///   - no quote was produced (no price observed for the asset, or no venue);
+///   - the spot leg would revert (no point hedging if settlement won't land);
+///   - the hedge leg would revert (the very thing we're about to submit);
+///   - the price snapshot is older than `cfg.max_price_age_secs`.
+pub fn should_submit(
+    outcome: &SimulationOutcome,
+    route: Option<&RouteQuote>,
+    intent: &PaymentIntent,
+    cfg: &SubmitConfig,
+) -> SettlerDecision {
+    let route = match route {
+        Some(r) => r,
+        None => return SettlerDecision::Reject(RejectReason::NoQuote),
+    };
+
+    if !outcome.spot.success {
+        return SettlerDecision::Reject(RejectReason::SpotWouldRevert(
+            outcome.spot.revert_reason.clone(),
+        ));
+    }
+
+    let hedge_outcome = match &outcome.hedge {
+        Some(h) => h,
+        None => return SettlerDecision::Reject(RejectReason::NoQuote),
+    };
+    if !hedge_outcome.success {
+        return SettlerDecision::Reject(RejectReason::HedgeWouldRevert(
+            hedge_outcome.revert_reason.clone(),
+        ));
+    }
+
+    if route.price_age_secs > cfg.max_price_age_secs {
+        return SettlerDecision::Reject(RejectReason::PriceTooStale {
+            age_secs: route.price_age_secs,
+            max_secs: cfg.max_price_age_secs,
+        });
+    }
+
+    SettlerDecision::Submit(SubmissionPlan {
+        intent_id: intent.intent_id,
+        hedge: PreparedTx {
+            to: route.hedge_venue,
+            data: hedge_calldata(route, intent.max_slippage_bps),
+            gas_limit: 300_000,
+        },
+    })
+}
+
+fn hedge_calldata(route: &RouteQuote, max_slippage_bps: u16) -> Bytes {
+    Bytes::from(
+        IHyperliquidGateway::placeShortCall {
+            asset: route.spot_asset,
+            size: route.hedge_size,
+            maxSlippageBps: max_slippage_bps,
+        }
+        .abi_encode(),
+    )
+}
+
 /// Shared, async-safe map from spot asset to its most recent observed price.
 #[derive(Clone, Default)]
 pub struct PriceBook {

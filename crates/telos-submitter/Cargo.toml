@@ -1,5 +1,5 @@
 [package]
-name = "telos-listener"
+name = "telos-submitter"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,11 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-telos-types = { workspace = true }
 telos-settler = { workspace = true }
-telos-submitter = { workspace = true }
 alloy = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }
-futures-util = { workspace = true }

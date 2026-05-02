@@ -4326,6 +4326,7 @@ dependencies = [
  "eyre",
  "telos-listener",
  "telos-settler",
+ "telos-submitter",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -4339,6 +4340,7 @@ dependencies = [
  "eyre",
  "futures-util",
  "telos-settler",
+ "telos-submitter",
  "telos-types",
  "tokio",
  "tracing",
@@ -4352,6 +4354,17 @@ dependencies = [
  "eyre",
  "revm",
  "telos-types",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "telos-submitter"
+version = "0.0.1"
+dependencies = [
+ "alloy",
+ "eyre",
+ "telos-settler",
  "tokio",
  "tracing",
 ]

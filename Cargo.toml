@@ -4,6 +4,7 @@ members = [
     "crates/telos-types",
     "crates/telos-listener",
     "crates/telos-settler",
+    "crates/telos-submitter",
     "crates/telos-cli",
 ]
 
@@ -19,6 +20,7 @@ rust-version = "1.85"
 telos-types = { path = "crates/telos-types" }
 telos-listener = { path = "crates/telos-listener" }
 telos-settler = { path = "crates/telos-settler" }
+telos-submitter = { path = "crates/telos-submitter" }
 
 alloy = { version = "1.0", features = ["full"] }
 revm = { version = "38", features = ["alloydb"] }

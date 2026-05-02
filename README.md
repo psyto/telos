@@ -81,8 +81,9 @@ telos/
 ├── crates/
 │   ├── telos-types/      # shared types: Intent, RouteQuote, etc.
 │   ├── telos-listener/   # Alloy-based event listener (Week 1–2)
-│   ├── telos-settler/    # REVM simulation harness (Week 3, fork support next)
-│   ├── telos-precompile/ # Reth execution extension (Week 5–8) [planned]
+│   ├── telos-settler/    # REVM simulation + decision gating (Weeks 3–6)
+│   ├── telos-submitter/  # signed broadcast layer, dry-run by default (Week 7)
+│   ├── telos-precompile/ # Reth execution extension (Week 8+) [planned]
 │   └── telos-cli/        # binary entry point
 └── Cargo.toml            # workspace
 ```
@@ -103,6 +104,10 @@ Concept stage. As of 2026-05-03:
 Both modes — empty in-memory state (`simulate_settlement`) and forked from a live RPC (`simulate_settlement_forked`, async, dispatched via `spawn_blocking` to bridge async Alloy ↔ sync REVM) — walk the same two-leg path. Outcomes carry per-leg success, gas, decoded revert reason, plus an `atomic_success` flag that is the AND of both legs.
 
 **Feedback loop**: a shared `PriceBook` is updated by every HL `Fill` and read by every decoded intent. `quote_route(intent, &prices, hedge_venue)` returns a `RouteQuote` with spot amount and a 1:1 hedge size at the current mark — the placeholder that funding-tilt logic will replace.
+
+**Decision gate**: `should_submit(outcome, route, intent, cfg)` returns `Submit(SubmissionPlan)` or `Reject(reason)` — rejecting on no quote, spot or hedge revert, or stale price (`max_price_age_secs` defaults to 30).
+
+**Submitter** (Week 7): when approved, the hedge tx is handed to a `Submitter` backed by an Alloy wallet-aware provider. **Dry-run by default**: estimates gas and logs the intended broadcast. Set `TELOS_BROADCAST=1` *and* provide `TELOS_SIGNER_KEY` + `TELOS_SUBMIT_RPC_URL` to actually broadcast. Telos signs only the hedge — the spot leg is the merchant's settlement, observed for gating but not broadcast by us.
 
 This repository is private during the learning phase. It will open if and when the architecture stabilizes.
 
