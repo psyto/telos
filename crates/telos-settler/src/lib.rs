@@ -1,11 +1,11 @@
-//! Telos settler — Week 3 simulation harness.
+//! Telos settler — Week 3–4 simulation harness.
 //!
 //! Two flavors:
 //!   - [`simulate_settlement`] runs against an empty in-memory state. Cheap
 //!     and synchronous, useful for proving the harness wiring is alive.
 //!   - [`simulate_settlement_forked`] forks a live RPC at a chosen block via
-//!     `AlloyDB`. The harness now exercises real account state, balances,
-//!     and bytecode — the next step is encoding actual swap calldata.
+//!     `AlloyDB`. Now exercises real account state — the simulated tx is the
+//!     payer's `transfer(merchant, amount)` against the settlement asset.
 //!
 //! Bridging async (Alloy) to sync (REVM): `AlloyDB`'s state-fetch is async,
 //! REVM's `Database` trait is sync. `WrapDatabaseAsync` calls `block_on` on
@@ -13,12 +13,18 @@
 //! the simulation onto a `spawn_blocking` thread and pass the parent
 //! runtime's `Handle` so the wrapped DB can submit fetches back to it.
 
+mod abi;
+
+use abi::IERC20;
 use alloy::eips::BlockId;
+use alloy::primitives::Bytes;
 use alloy::providers::ProviderBuilder;
+use alloy::sol_types::{SolCall, SolError, SolEvent};
 use eyre::{Result, eyre};
 use revm::{
     Context, ExecuteEvm, MainBuilder, MainContext,
     context::TxEnv,
+    context::result::{ExecutionResult, Output},
     database::{AlloyDB, CacheDB, EmptyDB, WrapDatabaseAsync},
     primitives::{TxKind, U256},
 };
@@ -30,29 +36,31 @@ use tracing::info;
 pub struct SimulationOutcome {
     pub success: bool,
     pub gas_used: u64,
+    /// Decoded `Error(string)` reason if the tx reverted with one.
+    pub revert_reason: Option<String>,
+    /// True if a matching ERC-20 `Transfer` event was emitted to the merchant.
+    pub transfer_emitted: bool,
 }
 
 /// Replay the merchant settlement transfer against an empty in-memory state.
 ///
-/// This is the harness, not the route — the actual swap+hedge calldata gets
-/// added once the precompile and venue ABIs are in place. What this proves
-/// is that REVM is correctly wired and reachable from the listener loop.
+/// With empty state the payer has no token balance, so this will revert.
+/// That's the point — the harness exercises the *failure path* end-to-end.
 pub fn simulate_settlement(intent: &PaymentIntent) -> Result<SimulationOutcome> {
     let mut evm = Context::mainnet()
         .with_db(CacheDB::<EmptyDB>::default())
         .build_mainnet();
 
     let result = evm.transact(build_tx(intent))?.result;
-    let outcome = SimulationOutcome {
-        success: result.is_success(),
-        gas_used: result.tx_gas_used(),
-    };
+    let outcome = decode_outcome(&result, intent);
 
     info!(
         target: "telos::settler",
         intent_id = %intent.intent_id,
         success = outcome.success,
         gas_used = outcome.gas_used,
+        revert = ?outcome.revert_reason,
+        transfer = outcome.transfer_emitted,
         "simulated (empty state)",
     );
 
@@ -60,9 +68,6 @@ pub fn simulate_settlement(intent: &PaymentIntent) -> Result<SimulationOutcome> 
 }
 
 /// Replay the same tx against forked state pulled from a live RPC.
-///
-/// `block` selects the fork point (`BlockId::latest()` is the usual choice
-/// for "what would happen right now"). The RPC URL must speak HTTP JSON-RPC.
 pub async fn simulate_settlement_forked(
     intent: &PaymentIntent,
     rpc_url: String,
@@ -86,16 +91,15 @@ pub async fn simulate_settlement_forked(
 
         let mut evm = Context::mainnet().with_db(db).build_mainnet();
         let result = evm.transact(build_tx(&intent))?.result;
-        let outcome = SimulationOutcome {
-            success: result.is_success(),
-            gas_used: result.tx_gas_used(),
-        };
+        let outcome = decode_outcome(&result, &intent);
 
         info!(
             target: "telos::settler",
             intent_id = %intent.intent_id,
             success = outcome.success,
             gas_used = outcome.gas_used,
+            revert = ?outcome.revert_reason,
+            transfer = outcome.transfer_emitted,
             "simulated (forked)",
         );
 
@@ -105,13 +109,59 @@ pub async fn simulate_settlement_forked(
     .map_err(|e| eyre!("settler task panicked: {e}"))?
 }
 
+/// Build a `transfer(merchant, amount)` call against the settlement asset.
+///
+/// The selector + ABI-encoded args go in `data`; `kind` targets the token
+/// contract (not the merchant), since ERC-20 transfers are contract calls.
 fn build_tx(intent: &PaymentIntent) -> TxEnv {
+    let calldata = IERC20::transferCall {
+        to: intent.merchant,
+        amount: intent.settlement_amount,
+    }
+    .abi_encode();
+
     TxEnv {
         caller: intent.payer,
-        kind: TxKind::Call(intent.merchant),
+        kind: TxKind::Call(intent.settlement_asset),
         value: U256::ZERO,
-        gas_limit: 100_000,
+        data: Bytes::from(calldata),
+        gas_limit: 200_000,
         gas_price: 0,
         ..Default::default()
     }
+}
+
+fn decode_outcome(
+    result: &ExecutionResult,
+    intent: &PaymentIntent,
+) -> SimulationOutcome {
+    let success = result.is_success();
+    let gas_used = result.tx_gas_used();
+
+    let revert_reason = match result {
+        ExecutionResult::Revert { output, .. } => decode_revert_reason(output),
+        _ => None,
+    };
+
+    let transfer_emitted = match result {
+        ExecutionResult::Success { output: Output::Call(_), logs, .. } => logs
+            .iter()
+            .any(|log| match IERC20::Transfer::decode_log(log) {
+                Ok(t) => t.from == intent.payer && t.to == intent.merchant,
+                Err(_) => false,
+            }),
+        _ => false,
+    };
+
+    SimulationOutcome { success, gas_used, revert_reason, transfer_emitted }
+}
+
+/// Decode standard `Error(string)` revert payloads.
+///
+/// Custom errors and `Panic(uint256)` would each need their own selector
+/// match; here we only handle the plain-string case since that's what
+/// OpenZeppelin's ERC-20 emits ("ERC20: transfer amount exceeds balance").
+fn decode_revert_reason(output: &Bytes) -> Option<String> {
+    let revert = alloy::sol_types::Revert::abi_decode(output).ok()?;
+    Some(revert.reason)
 }

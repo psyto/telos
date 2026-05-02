@@ -95,7 +95,9 @@ Concept stage. As of 2026-05-03:
 
 **Listener** handles four modes — headers (default), typed `PaymentIntent` on a Tempo contract, typed `Fill` on a Hyperliquid HyperEVM contract, or both multiplexed via `tokio::select!`. Configure via env vars: `TELOS_TEMPO_WS_URL` + `TELOS_TEMPO_CONTRACT`, `TELOS_HL_WS_URL` + `TELOS_HL_CONTRACT`.
 
-**Settler** runs each decoded intent through REVM. Two modes: in-memory empty state (`simulate_settlement`), or forked from a live RPC at the latest block (`simulate_settlement_forked`, async, dispatched via `spawn_blocking` to bridge async Alloy ↔ sync REVM). Set `TELOS_TEMPO_FORK_URL` to enable forked mode. Contract calldata and perp hedge sizing are next.
+**Settler** runs each decoded intent through REVM. The simulated tx is the payer's `IERC20.transfer(merchant, amount)` against the settlement asset (encoded via `sol!`). Two modes: empty in-memory state (`simulate_settlement`) or forked from a live RPC (`simulate_settlement_forked`, async, dispatched via `spawn_blocking` to bridge async Alloy ↔ sync REVM). Set `TELOS_TEMPO_FORK_URL` to enable forked mode.
+
+Outcomes capture success, gas used, decoded revert reason (`Error(string)`), and whether a matching `Transfer` event was emitted. Perp hedge sizing is next.
 
 This repository is private during the learning phase. It will open if and when the architecture stabilizes.
 
