@@ -1175,8 +1175,8 @@ now `staticcall` to `0x…0901` and receive the canonical hash.
 
 **Where to look.**
 
-- `crates/telos-settler/src/lib.rs` — `simulate_settlement`, `simulate_settlement_forked`, `run_legs<E>` ([this commit])
-- `crates/telos-settler/src/lib.rs#tests` — `settler_evm_can_call_intent_digest_precompile` ([this commit])
+- `crates/telos-settler/src/lib.rs` — `simulate_settlement`, `simulate_settlement_forked`, `run_legs<E>` ([72e93e2](https://github.com/psyto/telos/commit/72e93e2))
+- `crates/telos-settler/src/lib.rs#tests` — `settler_evm_can_call_intent_digest_precompile` ([72e93e2](https://github.com/psyto/telos/commit/72e93e2))
 
 ---
 
