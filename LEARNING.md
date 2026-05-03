@@ -1180,6 +1180,142 @@ now `staticcall` to `0x…0901` and receive the canonical hash.
 
 ---
 
+## Week 13 — A node façade with jsonrpsee
+
+**What you build.** `telos-node` is a jsonrpsee HTTP server that
+exposes `eth_call` (and `eth_chainId`) over JSON-RPC. Each call
+builds a fresh REVM with `TelosPrecompiles`, runs the requested
+transaction, and returns the output bytes. An integration test spins
+up the real server and proves a standard JSON-RPC client can call
+the precompile address and get back the canonical keccak.
+
+**What you learn.**
+
+`#[rpc(server)]` from `jsonrpsee::proc_macros` is the workhorse. You
+declare a trait with `#[method(name = "eth_call")]` annotations on
+each `async fn`, and the macro generates the server-side dispatch
+glue (a `TelosRpcServer` trait, `into_rpc()` to turn an instance into
+a registered module, the deserialisation of params from JSON-RPC).
+The trait names you write and the trait names the macro generates
+collide unless you keep them straight — name your trait `TelosRpc`,
+let the macro produce `TelosRpcServer`, and name your concrete
+implementation something else. We learned that the hard way.
+
+```rust
+#[rpc(server)]
+pub trait TelosRpc {
+    #[method(name = "eth_chainId")]
+    async fn chain_id(&self) -> Result<String, ErrorObjectOwned>;
+
+    #[method(name = "eth_call")]
+    async fn eth_call(&self, req: EthCallRequest) -> Result<String, ErrorObjectOwned>;
+}
+
+#[derive(Clone)]
+pub struct TelosNode {  // <-- not TelosRpcServer; that name is taken
+    chain_id: u64,
+}
+
+#[async_trait]
+impl TelosRpcServer for TelosNode {
+    // ...
+}
+```
+
+The dispatch into REVM is the part that makes this not just a
+generic JSON-RPC server — it is *a node façade*. Every `eth_call`
+becomes a TxEnv that runs through our custom EVM:
+
+```rust
+fn run_eth_call(req: EthCallRequest) -> Result<Bytes, String> {
+    let ctx = Context::mainnet().with_db(CacheDB::<EmptyDB>::default());
+    let spec = *ctx.cfg.spec();
+    let mut evm = Evm::new(
+        ctx,
+        EthInstructions::new_mainnet_with_spec(spec),
+        TelosPrecompiles::new(spec),
+    );
+
+    let tx = TxEnv {
+        caller: req.from.unwrap_or(Address::ZERO),
+        kind: TxKind::Call(req.to),
+        value: U256::ZERO,
+        data: req.data.unwrap_or_default(),
+        gas_limit: req.gas.unwrap_or(1_000_000),
+        gas_price: 0,
+        ..Default::default()
+    };
+
+    let result = evm.transact(tx).map_err(|e| format!("transact: {e}"))?.result;
+    match result {
+        ExecutionResult::Success { output: Output::Call(b), .. } => Ok(b),
+        ExecutionResult::Revert { output, .. } => Err(format!("revert: 0x{}", hex_encode(&output))),
+        ExecutionResult::Halt { reason, .. } => Err(format!("halt: {reason:?}")),
+        // ...
+    }
+}
+```
+
+The server bootstrap is small — a few lines of `ServerBuilder` plus
+the `into_rpc()` registration. Returning the bound address back to
+the caller lets tests use `:0` (let the OS pick a free port) and
+still know where to dial:
+
+```rust
+pub async fn run_server(cfg: ServerConfig) -> Result<(SocketAddr, ServerHandle)> {
+    let server = ServerBuilder::default().build(cfg.bind).await?;
+    let addr = server.local_addr()?;
+    let handle = server.start(TelosNode::new(cfg.chain_id).into_rpc());
+    Ok((addr, handle))
+}
+```
+
+The integration test is the proof. It spins up a real server on a
+real port, builds a real jsonrpsee HTTP client, sends an `eth_call`
+JSON-RPC request, and checks the response. End-to-end across the
+network stack:
+
+```rust
+let cfg = ServerConfig { bind: ([127, 0, 0, 1], 0).into(), chain_id: 31337 };
+let (addr, handle) = run_server(cfg).await.unwrap();
+let client = HttpClientBuilder::default().build(format!("http://{addr}")).unwrap();
+
+let calldata = vec![0x42u8; INTENT_DIGEST_INPUT_LEN];
+let req = json!({ "to": TELOS_INTENT_DIGEST_ADDRESS, "data": format!("0x{}", hex::encode(&calldata)) });
+let resp: String = client.request("eth_call", rpc_params![req]).await.unwrap();
+
+assert_eq!(resp, format!("0x{}", hex::encode(keccak256(&calldata).as_slice())));
+handle.stop().unwrap();
+```
+
+**What this is *not*.** This is not a real Ethereum node. There is
+no chain, no mempool, no consensus, no persistent state. Each call
+runs over `EmptyDB` and the post-state is dropped on the floor. A
+real Reth integration would plug `TelosPrecompiles` into
+`reth_evm::ConfigureEvm` so the same precompile is available across
+the entire node pipeline — block production, payload building,
+transaction validation, RPC. The pattern is the same; the plumbing
+is dramatically heavier.
+
+The honest reason this commit is jsonrpsee rather than Reth:
+**Reth is not a library on crates.io**. The `reth` crate at v0.1.0
+is a placeholder. Real Reth lives at `github.com/paradigmxyz/reth`
+and is consumed via git, with multi-minute build times, a
+hundreds-of-crates dependency graph, and an API that churns
+between releases. The right next step is a separate, deliberate
+project — fork `reth-node-ethereum`, swap `EthPrecompiles` for
+`TelosPrecompiles`, and run a devnet. The teaching value of this
+commit is that the wiring at the *EVM* layer (which is what we
+actually own) is identical regardless of which node hosts it.
+
+**Where to look.**
+
+- `crates/telos-node/src/rpc.rs` — `TelosRpc` trait + `TelosNode` impl + `run_eth_call` dispatch ([this commit])
+- `crates/telos-node/src/server.rs` — `run_server` bootstrap with `:0`-friendly bind reporting ([this commit])
+- `crates/telos-node/tests/eth_call.rs` — integration test with real HTTP client ([this commit])
+
+---
+
 ## Quick reference
 
 When you want to look something up rather than re-read the chapter.
@@ -1236,3 +1372,9 @@ When you want to look something up rather than re-read the chapter.
 | **REVM** | `EthPrecompileResult` → `InterpreterResult` conversion (Return / PrecompileOOG / PrecompileError) | precompile/src/lib.rs `eth_result_to_interpreter` |
 | **REVM** | `impl ExecuteEvm` bound for code generic over EVM types | settler/src/lib.rs `run_legs<E>` |
 | **Architecture** | Custom precompile lives in every simulation, not just unit tests | settler/src/lib.rs `simulate_settlement`/`_forked` |
+| **jsonrpsee** | `#[rpc(server)]` macro generates trait + dispatch glue | node/src/rpc.rs `TelosRpc` |
+| **jsonrpsee** | Trait-name vs generated-trait-name collision | node/src/rpc.rs `TelosNode` |
+| **jsonrpsee** | `ServerBuilder::default().build(addr).await?.start(rpc)` bootstrap | node/src/server.rs |
+| **jsonrpsee** | Bind to `:0` and report `local_addr()` for tests | node/src/server.rs |
+| **Architecture** | Node façade dispatches eth_call into custom EVM | node/src/rpc.rs `run_eth_call` |
+| **Architecture** | jsonrpsee façade now; Reth integration via `ConfigureEvm` is downstream | node/src/lib.rs (module doc) |

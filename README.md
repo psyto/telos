@@ -83,10 +83,11 @@ telos/
 ├── crates/
 │   ├── telos-types/      # shared types: Intent, RouteQuote, etc.
 │   ├── telos-listener/   # Alloy-based event listener (Week 1–2)
-│   ├── telos-settler/    # REVM simulation + decision gating (Weeks 3–6)
+│   ├── telos-settler/    # REVM simulation + decision gating (Weeks 3–6, 12)
 │   ├── telos-submitter/  # signed broadcast + confirmation (Weeks 7–8)
 │   ├── telos-store/      # sqlx + sqlite event log per intent (Week 9)
-│   ├── telos-precompile/ # custom EVM precompile: intent_digest (Week 10)
+│   ├── telos-precompile/ # custom EVM precompile: intent_digest (Weeks 10–11)
+│   ├── telos-node/       # jsonrpsee server exposing the custom EVM (Week 13)
 │   └── telos-cli/        # binary entry point
 └── Cargo.toml            # workspace
 ```
@@ -117,6 +118,12 @@ After broadcast, `submit_and_confirm` awaits the receipt under a `ConfirmConfig 
 **Persistence** (Week 9): set `TELOS_DB_URL=sqlite://./telos.db` to enable the `telos-store` event log. Every intent's lifecycle — observed → quoted → simulated → decided → settled — is appended as JSON-payload rows in a single `intent_events` table. On startup the CLI reports how many intents were observed but never settled in a previous run (the reconciliation set). Store writes are best-effort; a sqlite hiccup is logged but never poisons the in-memory pipeline.
 
 **Custom precompile** (Weeks 10–12): `telos-precompile` exposes `intent_digest`, an Eth-style precompile at `0x…0901` that hashes the canonical intent fields and returns a 32-byte digest. `TelosPrecompiles` wraps the standard `EthPrecompiles` and intercepts that one address — implementing `PrecompileProvider`. The settler now uses `Evm::new(...)` + `TelosPrecompiles` in both empty-state and forked simulations, so any tx in any simulation can call the precompile. The leg-walking inner loop is generic over `impl ExecuteEvm`, so swapping the precompile provider doesn't ripple through the call sites.
+
+**Node façade** (Week 13): `telos-node` is a small jsonrpsee server that exposes `eth_call` against a fresh REVM with `TelosPrecompiles`. Anyone can hit it from `cast`, alloy, or any standard JSON-RPC client and call into address `0x…0901` to get the canonical digest back. Stateless on purpose — each call builds an ephemeral EVM over `EmptyDB`. A real Reth integration would plug `TelosPrecompiles` into `reth_evm::ConfigureEvm` so the same precompile rides the node's normal pipeline; the pattern is the same, the plumbing is much heavier and is the deliberate next step.
+
+```bash
+TELOS_NODE_BIND=127.0.0.1:8545 cargo run -p telos-node
+```
 
 This repository is private during the learning phase. It will open if and when the architecture stabilizes.
 
