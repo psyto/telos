@@ -1083,6 +1083,103 @@ provider are the artifact; the node is the deployment target.
 
 ---
 
+## Week 12 — Threading the custom EVM through the application
+
+**What you build.** The settler stops calling `build_mainnet()` and
+starts using `Evm::new(ctx, EthInstructions::new_mainnet_with_spec(spec),
+TelosPrecompiles::new(spec))` in both `simulate_settlement` and
+`simulate_settlement_forked`. The `intent_digest` precompile is now
+available to any tx in any simulation — not just the standalone test
+in the precompile crate. A unit test in the settler proves the wiring
+by sending a tx that calls the precompile.
+
+**What you learn.**
+
+The leg-walking function `run_legs` was previously typed against
+`MainnetEvm<...>`, which hardcodes `EthPrecompiles`. Swapping the
+precompile provider would have changed the EVM type and broken every
+`run_legs` call site. The fix is the trait-bound abstraction: take
+`impl ExecuteEvm` with bounds on the associated types you actually
+read.
+
+```rust
+fn run_legs<E>(
+    evm: &mut E,
+    intent: &PaymentIntent,
+    route: Option<&RouteQuote>,
+    intent_max_slippage_bps: u16,
+    label: &str,
+) -> Result<SimulationOutcome>
+where
+    E: ExecuteEvm<Tx = TxEnv, ExecutionResult = ExecutionResult>,
+    E::Error: std::error::Error + Send + Sync + 'static,
+{
+    let spot_result = evm.transact(build_spot_tx(intent))?.result;
+    // …
+}
+```
+
+The `Tx = TxEnv` bound pins the input shape so `build_spot_tx` and
+`build_hedge_tx` continue to type-check. The `ExecutionResult =
+ExecutionResult` bound (note the same name on both sides — associated
+type name vs the concrete type) lets `decode_leg` keep working
+without paramaterising it. Every other type — instruction set,
+precompile provider, frame stack, database — disappears behind the
+trait. This is the right pattern any time you want a function that
+operates on "an EVM" without caring how it was assembled.
+
+The construction at each call site shows the symmetry between the
+empty-state and forked paths:
+
+```rust
+// simulate_settlement (empty state)
+let ctx = Context::mainnet().with_db(CacheDB::<EmptyDB>::default());
+let spec = *ctx.cfg.spec();
+let mut evm = Evm::new(
+    ctx,
+    EthInstructions::new_mainnet_with_spec(spec),
+    TelosPrecompiles::new(spec),
+);
+run_legs(&mut evm, intent, route, slippage, "empty state")
+```
+
+```rust
+// simulate_settlement_forked (inside spawn_blocking)
+let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+let alloy_db = AlloyDB::new(provider, block);
+let wrapped = WrapDatabaseAsync::new(alloy_db).ok_or_else(/* … */)?;
+let db = CacheDB::new(wrapped);
+
+let ctx = Context::mainnet().with_db(db);
+let spec = *ctx.cfg.spec();
+let mut evm = Evm::new(
+    ctx,
+    EthInstructions::new_mainnet_with_spec(spec),
+    TelosPrecompiles::new(spec),
+);
+run_legs(&mut evm, &intent, route.as_ref(), slippage, "forked")
+```
+
+Both paths construct the EVM the same way — the only thing that
+changes is the database (`CacheDB<EmptyDB>` vs `CacheDB<WrapDatabaseAsync<AlloyDB>>`).
+Because `run_legs` no longer cares about the concrete EVM type, both
+paths slot into the same downstream code.
+
+The settler test `settler_evm_can_call_intent_digest_precompile`
+proves that a tx sent into the settler's EVM can call the
+precompile and get back the canonical digest. This is the bridge
+from "the precompile lives in its own test" to "the precompile lives
+in the application." Any contract that the simulator runs (ERC-20s,
+the bundler, the HL gateway mock, future settlement routers) can
+now `staticcall` to `0x…0901` and receive the canonical hash.
+
+**Where to look.**
+
+- `crates/telos-settler/src/lib.rs` — `simulate_settlement`, `simulate_settlement_forked`, `run_legs<E>` ([this commit])
+- `crates/telos-settler/src/lib.rs#tests` — `settler_evm_can_call_intent_digest_precompile` ([this commit])
+
+---
+
 ## Quick reference
 
 When you want to look something up rather than re-read the chapter.
@@ -1137,3 +1234,5 @@ When you want to look something up rather than re-read the chapter.
 | **REVM** | Wrap `EthPrecompiles`, intercept your address, delegate the rest | precompile/src/lib.rs `run` |
 | **REVM** | Bypass `build_mainnet()` and use `Evm::new(ctx, instructions, precompiles)` | precompile/src/lib.rs tests |
 | **REVM** | `EthPrecompileResult` → `InterpreterResult` conversion (Return / PrecompileOOG / PrecompileError) | precompile/src/lib.rs `eth_result_to_interpreter` |
+| **REVM** | `impl ExecuteEvm` bound for code generic over EVM types | settler/src/lib.rs `run_legs<E>` |
+| **Architecture** | Custom precompile lives in every simulation, not just unit tests | settler/src/lib.rs `simulate_settlement`/`_forked` |

@@ -4816,6 +4816,7 @@ dependencies = [
  "eyre",
  "revm",
  "serde",
+ "telos-precompile",
  "telos-types",
  "tokio",
  "tracing",

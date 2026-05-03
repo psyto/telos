@@ -1,4 +1,4 @@
-//! Telos settler — Week 3–6 simulation harness.
+//! Telos settler — Weeks 3–12 simulation harness.
 //!
 //! Two flavors:
 //!   - [`simulate_settlement`] runs against an empty in-memory state. Cheap
@@ -12,6 +12,13 @@
 //! for the perp hedge. REVM's `Context` accumulates state between
 //! `transact` calls, so the second leg sees the post-state of the first.
 //! `atomic_success` is the AND of both legs (or just spot when no quote).
+//!
+//! Both flavors use [`telos_precompile::TelosPrecompiles`] in place of the
+//! stock `EthPrecompiles`, so any tx in the simulation can call the Telos
+//! `intent_digest` precompile at `0x…0901`. The leg-walking inner loop
+//! [`run_legs`] is generic over `impl ExecuteEvm` so the same code drives
+//! the empty-state and forked EVMs without caring what precompile provider
+//! was wired in.
 //!
 //! Bridging async (Alloy) to sync (REVM): `AlloyDB`'s state-fetch is async,
 //! REVM's `Database` trait is sync. `WrapDatabaseAsync` calls `block_on` on
@@ -28,12 +35,15 @@ use alloy::providers::ProviderBuilder;
 use alloy::sol_types::{SolCall, SolError, SolEvent};
 use eyre::{Result, eyre};
 use revm::{
-    Context, ExecuteEvm, MainBuilder, MainContext,
+    Context, ExecuteEvm, MainContext,
+    context::Evm,
     context::TxEnv,
     context::result::{ExecutionResult, Output},
     database::{AlloyDB, CacheDB, EmptyDB, WrapDatabaseAsync},
+    handler::instructions::EthInstructions,
     primitives::{TxKind, U256},
 };
+use telos_precompile::TelosPrecompiles;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -222,9 +232,13 @@ pub fn simulate_settlement(
     route: Option<&RouteQuote>,
     intent_max_slippage_bps: u16,
 ) -> Result<SimulationOutcome> {
-    let mut evm = Context::mainnet()
-        .with_db(CacheDB::<EmptyDB>::default())
-        .build_mainnet();
+    let ctx = Context::mainnet().with_db(CacheDB::<EmptyDB>::default());
+    let spec = *ctx.cfg.spec();
+    let mut evm = Evm::new(
+        ctx,
+        EthInstructions::new_mainnet_with_spec(spec),
+        TelosPrecompiles::new(spec),
+    );
     run_legs(&mut evm, intent, route, intent_max_slippage_bps, "empty state")
 }
 
@@ -249,28 +263,37 @@ pub async fn simulate_settlement_forked(
             .ok_or_else(|| eyre!("no tokio runtime available for AlloyDB"))?;
         let db = CacheDB::new(wrapped);
 
-        let mut evm = Context::mainnet().with_db(db).build_mainnet();
+        let ctx = Context::mainnet().with_db(db);
+        let spec = *ctx.cfg.spec();
+        let mut evm = Evm::new(
+            ctx,
+            EthInstructions::new_mainnet_with_spec(spec),
+            TelosPrecompiles::new(spec),
+        );
         run_legs(&mut evm, &intent, route.as_ref(), intent_max_slippage_bps, "forked")
     })
     .await
     .map_err(|e| eyre!("settler task panicked: {e}"))?
 }
 
-/// Walk both legs in order against whichever EVM context the caller built.
+/// Walk both legs in order against whichever EVM the caller built.
 ///
-/// Generic over the database type so the empty-state and forked paths share
-/// this code. `transact` mutates the EVM in place — the hedge tx sees any
+/// Generic over `impl ExecuteEvm` so the empty-state and forked paths share
+/// this code regardless of which precompile provider was wired in. The
+/// `Tx = TxEnv` and `ExecutionResult = ExecutionResult` bounds pin the
+/// types we actually decode against; everything else is left to inference.
+/// `transact` mutates the EVM in place — the hedge tx sees any
 /// nonce/balance/storage changes the spot tx made.
-fn run_legs<DB>(
-    evm: &mut revm::MainnetEvm<Context<revm::context::BlockEnv, TxEnv, revm::context::CfgEnv, DB>>,
+fn run_legs<E>(
+    evm: &mut E,
     intent: &PaymentIntent,
     route: Option<&RouteQuote>,
     intent_max_slippage_bps: u16,
     label: &str,
 ) -> Result<SimulationOutcome>
 where
-    DB: revm::database_interface::Database,
-    <DB as revm::database_interface::Database>::Error: std::error::Error + Send + Sync + 'static,
+    E: ExecuteEvm<Tx = TxEnv, ExecutionResult = ExecutionResult>,
+    E::Error: std::error::Error + Send + Sync + 'static,
 {
     let spot_result = evm.transact(build_spot_tx(intent))?.result;
     let spot = decode_leg(&spot_result);
@@ -392,4 +415,45 @@ fn scan_order_placed_event(result: &ExecutionResult, asset: Address) -> bool {
 fn decode_revert_reason(output: &Bytes) -> Option<String> {
     let revert = alloy::sol_types::Revert::abi_decode(output).ok()?;
     Some(revert.reason)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use telos_precompile::{INTENT_DIGEST_INPUT_LEN, TELOS_INTENT_DIGEST_ADDRESS};
+
+    /// The custom precompile is reachable from inside the settler's REVM.
+    /// A bundler/router contract on Tempo could call `intent_digest` mid-tx
+    /// to commit the canonical intent identity; this test proves the
+    /// precompile is wired into every simulation, not just the standalone
+    /// tests in the precompile crate.
+    #[test]
+    fn settler_evm_can_call_intent_digest_precompile() {
+        let ctx = Context::mainnet().with_db(CacheDB::<EmptyDB>::default());
+        let spec = *ctx.cfg.spec();
+        let mut evm = Evm::new(
+            ctx,
+            EthInstructions::new_mainnet_with_spec(spec),
+            TelosPrecompiles::new(spec),
+        );
+
+        let calldata = vec![0xAB; INTENT_DIGEST_INPUT_LEN];
+        let tx = TxEnv {
+            caller: Address::ZERO,
+            kind: TxKind::Call(TELOS_INTENT_DIGEST_ADDRESS),
+            value: U256::ZERO,
+            data: Bytes::from(calldata.clone()),
+            gas_limit: 100_000,
+            gas_price: 0,
+            ..Default::default()
+        };
+
+        let result = evm.transact(tx).expect("transact succeeds").result;
+        let output = match result {
+            ExecutionResult::Success { output: Output::Call(b), .. } => b,
+            other => panic!("expected Success, got {other:?}"),
+        };
+        let expected = alloy::primitives::keccak256(calldata.as_slice());
+        assert_eq!(output.as_ref(), expected.as_slice());
+    }
 }
