@@ -935,8 +935,8 @@ implementation.
 
 **Where to look.**
 
-- `crates/telos-precompile/src/lib.rs` — `intent_digest`, address constant, gas constants ([this commit])
-- `crates/telos-precompile/src/lib.rs#tests` — happy path + halts + determinism ([this commit])
+- `crates/telos-precompile/src/lib.rs` — `intent_digest`, address constant, gas constants ([622ecf3](https://github.com/psyto/telos/commit/622ecf3))
+- `crates/telos-precompile/src/lib.rs#tests` — happy path + halts + determinism ([622ecf3](https://github.com/psyto/telos/commit/622ecf3))
 
 ---
 
