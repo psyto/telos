@@ -825,10 +825,10 @@ phase: you can iterate on the simulator without managing a database.
 
 **Where to look.**
 
-- `crates/telos-store/migrations/0001_initial.sql` — the schema ([this commit])
-- `crates/telos-store/src/lib.rs` — `Store::open`, `record_event`, `count_pending` ([this commit])
-- `crates/telos-listener/src/lib.rs` — `record()` helper, store calls in `spawn_simulation` ([this commit])
-- `crates/telos-cli/src/main.rs` — `build_store`, `TELOS_DB_URL` ([this commit])
+- `crates/telos-store/migrations/0001_initial.sql` — the schema ([b78cfc5](https://github.com/psyto/telos/commit/b78cfc5))
+- `crates/telos-store/src/lib.rs` — `Store::open`, `record_event`, `count_pending` ([b78cfc5](https://github.com/psyto/telos/commit/b78cfc5))
+- `crates/telos-listener/src/lib.rs` — `record()` helper, store calls in `spawn_simulation` ([b78cfc5](https://github.com/psyto/telos/commit/b78cfc5))
+- `crates/telos-cli/src/main.rs` — `build_store`, `TELOS_DB_URL` ([b78cfc5](https://github.com/psyto/telos/commit/b78cfc5))
 
 ---
 
