@@ -19,7 +19,13 @@
 //! block and unit tests that exercise it directly.
 
 use alloy::primitives::{Address, Bytes, address, keccak256};
+use revm::context::Cfg;
+use revm::context_interface::ContextTr;
+use revm::handler::{EthPrecompiles, PrecompileProvider};
+use revm::interpreter::interpreter_action::CallInputs;
+use revm::interpreter::{Gas, InstructionResult, InterpreterResult};
 use revm::precompile::{EthPrecompileOutput, EthPrecompileResult, PrecompileHalt};
+use revm::primitives::hardfork::SpecId;
 
 /// Address the precompile lives at. Convention: Telos-namespace precompiles
 /// occupy 0x…0901 onwards, well clear of the EIP-allocated 0x01–0x0a band.
@@ -66,9 +72,103 @@ pub fn intent_digest(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     ))
 }
 
+/// Custom [`PrecompileProvider`] that adds [`intent_digest`] to the standard
+/// Ethereum set. Cloneable so it can be slotted into the EVM builder once;
+/// `set_spec` and `run` mutate through the wrapped `EthPrecompiles` for every
+/// non-Telos address.
+#[derive(Debug, Clone)]
+pub struct TelosPrecompiles {
+    eth: EthPrecompiles,
+}
+
+impl TelosPrecompiles {
+    pub fn new(spec: SpecId) -> Self {
+        Self { eth: EthPrecompiles::new(spec) }
+    }
+}
+
+impl<CTX: ContextTr> PrecompileProvider<CTX> for TelosPrecompiles {
+    type Output = InterpreterResult;
+
+    fn set_spec(&mut self, spec: <CTX::Cfg as Cfg>::Spec) -> bool {
+        <EthPrecompiles as PrecompileProvider<CTX>>::set_spec(&mut self.eth, spec)
+    }
+
+    fn run(
+        &mut self,
+        ctx: &mut CTX,
+        inputs: &CallInputs,
+    ) -> Result<Option<InterpreterResult>, String> {
+        if inputs.bytecode_address != TELOS_INTENT_DIGEST_ADDRESS {
+            return self.eth.run(ctx, inputs);
+        }
+
+        // Materialise the calldata. as_bytes() handles both inline-bytes and
+        // shared-buffer forms transparently.
+        let bytes_ref = inputs.input.as_bytes(ctx);
+        let eth_result = intent_digest(&bytes_ref, inputs.gas_limit);
+
+        Ok(Some(eth_result_to_interpreter(eth_result, inputs.gas_limit)))
+    }
+
+    fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
+        let mut addresses: Vec<Address> =
+            <EthPrecompiles as PrecompileProvider<CTX>>::warm_addresses(&self.eth).collect();
+        addresses.push(TELOS_INTENT_DIGEST_ADDRESS);
+        Box::new(addresses.into_iter())
+    }
+
+    fn contains(&self, address: &Address) -> bool {
+        *address == TELOS_INTENT_DIGEST_ADDRESS
+            || <EthPrecompiles as PrecompileProvider<CTX>>::contains(&self.eth, address)
+    }
+}
+
+/// Convert an Eth-style precompile result into the [`InterpreterResult`] shape
+/// that EVM frame execution expects. Mirrors the behaviour the stock
+/// EthPrecompiles uses internally so callers see consistent gas accounting.
+fn eth_result_to_interpreter(
+    result: EthPrecompileResult,
+    gas_limit: u64,
+) -> InterpreterResult {
+    let mut gas = Gas::new(gas_limit);
+    match result {
+        Ok(out) => {
+            let _ = gas.record_regular_cost(out.gas_used);
+            InterpreterResult {
+                result: InstructionResult::Return,
+                gas,
+                output: out.bytes,
+            }
+        }
+        Err(PrecompileHalt::OutOfGas) => {
+            gas.spend_all();
+            InterpreterResult {
+                result: InstructionResult::PrecompileOOG,
+                gas,
+                output: Bytes::new(),
+            }
+        }
+        Err(_other) => {
+            gas.spend_all();
+            InterpreterResult {
+                result: InstructionResult::PrecompileError,
+                gas,
+                output: Bytes::new(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use revm::context::TxEnv;
+    use revm::context::result::{ExecutionResult, Output};
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::handler::instructions::EthInstructions;
+    use revm::primitives::{TxKind, U256};
+    use revm::{Context, ExecuteEvm, MainContext};
 
     fn sample_input() -> Vec<u8> {
         let mut buf = vec![0u8; INTENT_DIGEST_INPUT_LEN];
@@ -123,5 +223,39 @@ mod tests {
         let a = intent_digest(&sample_input(), 100_000).unwrap();
         let b = intent_digest(&sample_input(), 100_000).unwrap();
         assert_eq!(a.bytes, b.bytes);
+    }
+
+    /// Full integration: build a REVM with TelosPrecompiles, send a tx that
+    /// targets the precompile address, assert the call output matches the
+    /// off-chain keccak. This is what proves the registration plumbing works.
+    #[test]
+    fn evm_call_returns_canonical_digest() {
+        let ctx = Context::mainnet().with_db(CacheDB::<EmptyDB>::default());
+        let spec = *ctx.cfg.spec();
+        let mut evm = revm::context::Evm::new(
+            ctx,
+            EthInstructions::new_mainnet_with_spec(spec),
+            TelosPrecompiles::new(spec),
+        );
+
+        let calldata = sample_input();
+        let tx = TxEnv {
+            caller: Address::ZERO,
+            kind: TxKind::Call(TELOS_INTENT_DIGEST_ADDRESS),
+            value: U256::ZERO,
+            data: Bytes::from(calldata.clone()),
+            gas_limit: 100_000,
+            gas_price: 0,
+            ..Default::default()
+        };
+
+        let result = evm.transact(tx).expect("transact succeeds").result;
+        let output = match result {
+            ExecutionResult::Success { output: Output::Call(b), .. } => b,
+            other => panic!("expected Success, got {other:?}"),
+        };
+
+        let expected = keccak256(calldata.as_slice());
+        assert_eq!(output.as_ref(), expected.as_slice());
     }
 }

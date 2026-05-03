@@ -940,6 +940,149 @@ implementation.
 
 ---
 
+## Week 11 — Wire the precompile into a real REVM
+
+**What you build.** A `TelosPrecompiles` provider that wraps the
+standard `EthPrecompiles` and intercepts the `intent_digest` address.
+Then a manual `Evm::new(...)` that uses the custom provider instead
+of the default `build_mainnet()` pipeline. An integration test sends
+a transaction through that EVM, calls the precompile, and asserts
+the returned bytes equal the off-chain keccak.
+
+**What you learn.**
+
+`PrecompileProvider<CTX>` is the trait you implement to add (or
+replace) precompiles in a REVM context. Four required methods:
+`set_spec` updates the active hardfork, `run` is the dispatch (you
+return `Ok(Some(InterpreterResult))` on a hit, `Ok(None)` to fall
+through), `warm_addresses` exposes the addresses to mark warm at the
+start of every tx (EIP-2929), and `contains` is the cheap
+membership check the EVM uses to decide whether to even consult
+your provider. Get `set_spec` and `contains` right and the rest
+follows.
+
+```rust
+impl<CTX: ContextTr> PrecompileProvider<CTX> for TelosPrecompiles {
+    type Output = InterpreterResult;
+
+    fn run(
+        &mut self,
+        ctx: &mut CTX,
+        inputs: &CallInputs,
+    ) -> Result<Option<InterpreterResult>, String> {
+        if inputs.bytecode_address != TELOS_INTENT_DIGEST_ADDRESS {
+            return self.eth.run(ctx, inputs);
+        }
+        let bytes_ref = inputs.input.as_bytes(ctx);
+        let eth_result = intent_digest(&bytes_ref, inputs.gas_limit);
+        Ok(Some(eth_result_to_interpreter(eth_result, inputs.gas_limit)))
+    }
+    // ...
+}
+```
+
+The wrapping pattern is the cleanest way to add precompiles: hold an
+`EthPrecompiles` field, intercept *your* addresses in `run`, delegate
+everything else. `set_spec` and `warm_addresses` and `contains` all
+forward (with `||` to add your address). You inherit the entire
+existing precompile set, you do not have to rebuild it.
+
+**Why we cannot use `build_mainnet()`.** The convenience method
+hard-codes `EthPrecompiles` as the precompile field of the resulting
+`Evm`. To use a custom provider you have to construct the `Evm`
+yourself — `Evm::new(ctx, instructions, precompiles)`. Once you see
+this, every "how do I customise X in REVM" question has the same
+answer: bypass the convenience builder and use the real constructor.
+
+```rust
+let ctx = Context::mainnet().with_db(CacheDB::<EmptyDB>::default());
+let spec = *ctx.cfg.spec();
+let mut evm = Evm::new(
+    ctx,
+    EthInstructions::new_mainnet_with_spec(spec),
+    TelosPrecompiles::new(spec),
+);
+
+let result = evm.transact(tx)?.result;
+```
+
+The bridge between Eth-style precompile output and the EVM frame
+expects an `InterpreterResult`. The conversion sets the gas, marks
+the result `Return` on success or `PrecompileOOG` / `PrecompileError`
+on halts, and clears output bytes for halts. The stock EVM ships a
+helper for this; here we wrote it inline so the lifecycle is
+visible:
+
+```rust
+fn eth_result_to_interpreter(result: EthPrecompileResult, gas_limit: u64) -> InterpreterResult {
+    let mut gas = Gas::new(gas_limit);
+    match result {
+        Ok(out) => {
+            let _ = gas.record_regular_cost(out.gas_used);
+            InterpreterResult { result: InstructionResult::Return, gas, output: out.bytes }
+        }
+        Err(PrecompileHalt::OutOfGas) => {
+            gas.spend_all();
+            InterpreterResult { result: InstructionResult::PrecompileOOG, gas, output: Bytes::new() }
+        }
+        Err(_other) => {
+            gas.spend_all();
+            InterpreterResult { result: InstructionResult::PrecompileError, gas, output: Bytes::new() }
+        }
+    }
+}
+```
+
+The integration test is the proof that the wiring works end-to-end.
+A real EVM instance, a real transaction, the custom precompile
+intercepted at the bytecode address, the bytes returned to the
+caller — all the way through:
+
+```rust
+let ctx = Context::mainnet().with_db(CacheDB::<EmptyDB>::default());
+let spec = *ctx.cfg.spec();
+let mut evm = Evm::new(
+    ctx,
+    EthInstructions::new_mainnet_with_spec(spec),
+    TelosPrecompiles::new(spec),
+);
+
+let calldata = sample_input();
+let tx = TxEnv {
+    caller: Address::ZERO,
+    kind: TxKind::Call(TELOS_INTENT_DIGEST_ADDRESS),
+    data: Bytes::from(calldata.clone()),
+    gas_limit: 100_000,
+    gas_price: 0,
+    ..Default::default()
+};
+
+let result = evm.transact(tx).unwrap().result;
+let output = match result {
+    ExecutionResult::Success { output: Output::Call(b), .. } => b,
+    other => panic!("expected Success, got {other:?}"),
+};
+assert_eq!(output.as_ref(), keccak256(&calldata).as_slice());
+```
+
+That is the picture closing. We started Week 1 with the receive
+side — typed events flowing in from a chain. We end Week 11 with the
+send side — a transaction we sent into a custom EVM, against our own
+precompile, returning the canonical bytes the rest of the system
+will rely on.
+
+The remaining step — wiring this same `TelosPrecompiles` into a real
+Reth node, so the precompile lives at `0x…0901` on a deployed
+network — is purely node configuration. The function and the
+provider are the artifact; the node is the deployment target.
+
+**Where to look.**
+
+- `crates/telos-precompile/src/lib.rs` — `TelosPrecompiles`, `PrecompileProvider` impl, `eth_result_to_interpreter` ([this commit])
+- `crates/telos-precompile/src/lib.rs#tests` — `evm_call_returns_canonical_digest` integration test ([this commit])
+
+---
+
 ## Quick reference
 
 When you want to look something up rather than re-read the chapter.
@@ -990,3 +1133,7 @@ When you want to look something up rather than re-read the chapter.
 | **Design** | Precompile gas schedule: base + per-byte | precompile/src/lib.rs |
 | **Design** | Wrong-length input halts rather than zero-pads | precompile/src/lib.rs `intent_digest` |
 | **Architecture** | Precompile crate stays node-agnostic; wiring is downstream | precompile/src/lib.rs (module doc) |
+| **REVM** | `PrecompileProvider<CTX>` trait — set_spec, run, warm_addresses, contains | precompile/src/lib.rs `TelosPrecompiles` |
+| **REVM** | Wrap `EthPrecompiles`, intercept your address, delegate the rest | precompile/src/lib.rs `run` |
+| **REVM** | Bypass `build_mainnet()` and use `Evm::new(ctx, instructions, precompiles)` | precompile/src/lib.rs tests |
+| **REVM** | `EthPrecompileResult` → `InterpreterResult` conversion (Return / PrecompileOOG / PrecompileError) | precompile/src/lib.rs `eth_result_to_interpreter` |

@@ -116,7 +116,7 @@ After broadcast, `submit_and_confirm` awaits the receipt under a `ConfirmConfig 
 
 **Persistence** (Week 9): set `TELOS_DB_URL=sqlite://./telos.db` to enable the `telos-store` event log. Every intent's lifecycle — observed → quoted → simulated → decided → settled — is appended as JSON-payload rows in a single `intent_events` table. On startup the CLI reports how many intents were observed but never settled in a previous run (the reconciliation set). Store writes are best-effort; a sqlite hiccup is logged but never poisons the in-memory pipeline.
 
-**Custom precompile** (Week 10): `telos-precompile` exposes `intent_digest`, an Eth-style precompile at `0x…0901` that hashes the canonical intent fields and returns a 32-byte digest. The crate is node-agnostic — it ships the function and unit tests; wiring it into a Reth node (via `PrecompileProvider`) is the deliberate next step, not in this commit.
+**Custom precompile** (Weeks 10–11): `telos-precompile` exposes `intent_digest`, an Eth-style precompile at `0x…0901` that hashes the canonical intent fields and returns a 32-byte digest. `TelosPrecompiles` wraps the standard `EthPrecompiles` and intercepts that one address — implementing `PrecompileProvider`. Constructing a custom EVM is one line: `Evm::new(ctx, EthInstructions::new_mainnet_with_spec(spec), TelosPrecompiles::new(spec))`. An integration test sends a tx through that EVM, calls the precompile, and asserts the returned bytes equal the off-chain keccak.
 
 This repository is private during the learning phase. It will open if and when the architecture stabilizes.
 
