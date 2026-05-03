@@ -1,0 +1,11 @@
+[package]
+name = "telos-precompile"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alloy = { workspace = true }
+revm = { workspace = true }

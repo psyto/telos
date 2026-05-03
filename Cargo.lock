@@ -4801,6 +4801,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "telos-precompile"
+version = "0.0.1"
+dependencies = [
+ "alloy",
+ "revm",
+]
+
+[[package]]
 name = "telos-settler"
 version = "0.0.1"
 dependencies = [

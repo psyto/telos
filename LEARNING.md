@@ -832,6 +832,114 @@ phase: you can iterate on the simulator without managing a database.
 
 ---
 
+## Week 10 — Your first custom EVM precompile
+
+**What you build.** A `telos-precompile` crate that exports
+`intent_digest`, an Eth-style precompile. It lives at a fixed address
+(`0x…0901`), takes the ABI-encoded intent fields, returns the canonical
+32-byte keccak digest. The crate stays node-agnostic: it ships the
+function and unit tests, leaving the Reth-node wiring as the next
+deliberate step.
+
+**What you learn.**
+
+A precompile is **native Rust at a fixed EVM address**. When a tx
+targets that address, the EVM short-circuits and runs your function
+instead of interpreting bytecode. Existing Ethereum precompiles
+(ecrecover at 0x01, sha256 at 0x02, modexp at 0x05, …) all follow this
+pattern. Custom L1s and L2s extend the set with their own — Hyperliquid's
+CoreWriter, Polygon's StateReader, and so on. Telos's `intent_digest`
+joins that family.
+
+The Eth-style signature is the simple one — `&[u8]` in, gas limit in,
+`EthPrecompileResult` out. `EthPrecompileOutput` carries the gas used
+and the output bytes; `PrecompileHalt` carries the non-fatal failure
+reasons (out-of-gas, wrong input length, curve-point-off-curve, etc.).
+Crucially, **halts are `Ok(...)`-shaped at the framework level** — they
+unwind the EVM call cleanly, not the host process. Only fatal,
+unrecoverable errors go in the outer `Err`.
+
+```rust
+pub fn intent_digest(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
+    let gas_used = INTENT_DIGEST_BASE_GAS + (input.len() as u64) * INTENT_DIGEST_PER_BYTE_GAS;
+    if gas_used > gas_limit {
+        return Err(PrecompileHalt::OutOfGas);
+    }
+    if input.len() != INTENT_DIGEST_INPUT_LEN {
+        return Err(PrecompileHalt::other(format!(
+            "intent_digest: expected {} bytes, got {}",
+            INTENT_DIGEST_INPUT_LEN,
+            input.len(),
+        )));
+    }
+    let digest = keccak256(input);
+    Ok(EthPrecompileOutput::new(
+        gas_used,
+        Bytes::copy_from_slice(digest.as_slice()),
+    ))
+}
+```
+
+The gas schedule mirrors SHA-256: a fixed base plus a small per-byte
+cost. Fixed base covers the dispatch overhead; per-byte covers the work
+keccak does on the buffer. Mirroring an existing precompile's shape
+makes the cost predictable to anyone who has already integrated SHA-256.
+
+```rust
+pub const INTENT_DIGEST_BASE_GAS: u64 = 500;
+pub const INTENT_DIGEST_PER_BYTE_GAS: u64 = 25;
+```
+
+**Wrong-length input is a halt, not a zero-pad.** This is a defensive
+default that costs nothing but prevents an entire class of subtle bugs:
+a caller could otherwise truncate or omit fields and silently get back
+a "valid" digest of the wrong data.
+
+```rust
+if input.len() != INTENT_DIGEST_INPUT_LEN {
+    return Err(PrecompileHalt::other(/* … */));
+}
+```
+
+The unit tests are the first integration point. They exercise the
+function directly — happy path matches an off-chain `keccak256`, OOG
+halts before any hashing happens, wrong-length input halts with a
+descriptive message, and the same input always produces the same
+digest. These properties are the *contract* a downstream Reth node will
+rely on; pinning them at the unit level catches regressions early.
+
+```rust
+#[test]
+fn happy_path_matches_offchain_keccak() {
+    let input = sample_input();
+    let result = intent_digest(&input, 100_000).expect("should succeed");
+    let expected = keccak256(input.as_slice());
+    assert_eq!(result.bytes.as_ref(), expected.as_slice());
+}
+```
+
+**What is deliberately out of scope here.** Wiring this precompile into
+an actual REVM context (via `PrecompileProvider`) and into a Reth node
+(via the node config + a custom EVM type) is the next deliberate step,
+not this commit. The shape of that work:
+
+- Implement `PrecompileProvider<CTX>` — likely by wrapping
+  `EthPrecompiles` and intercepting the `intent_digest` address.
+- Use it as the `Precompiles` parameter when configuring a custom EVM.
+- For a real Reth node: pass the custom EVM type into the node builder.
+
+Splitting the function from the wiring keeps this crate node-agnostic.
+The same `intent_digest` function will eventually run in unit tests, in
+a custom REVM, and in a Reth node — three different harnesses, one
+implementation.
+
+**Where to look.**
+
+- `crates/telos-precompile/src/lib.rs` — `intent_digest`, address constant, gas constants ([this commit])
+- `crates/telos-precompile/src/lib.rs#tests` — happy path + halts + determinism ([this commit])
+
+---
+
 ## Quick reference
 
 When you want to look something up rather than re-read the chapter.
@@ -876,3 +984,9 @@ When you want to look something up rather than re-read the chapter.
 | **Design** | Store writes are best-effort, never poison the pipeline | listener/src/lib.rs `record` helper |
 | **Architecture** | Persistence is opt-in via env var | cli/src/main.rs `build_store` |
 | **Architecture** | Pending-intents query for restart reconciliation | store/src/lib.rs `count_pending` |
+| **REVM** | Eth-style precompile signature `fn(&[u8], u64) -> EthPrecompileResult` | precompile/src/lib.rs `intent_digest` |
+| **REVM** | `PrecompileHalt` for non-fatal failures (OOG, bad input) | precompile/src/lib.rs |
+| **REVM** | Halts are `Ok` at the framework level; only fatal errors are `Err` | precompile/src/lib.rs |
+| **Design** | Precompile gas schedule: base + per-byte | precompile/src/lib.rs |
+| **Design** | Wrong-length input halts rather than zero-pads | precompile/src/lib.rs `intent_digest` |
+| **Architecture** | Precompile crate stays node-agnostic; wiring is downstream | precompile/src/lib.rs (module doc) |

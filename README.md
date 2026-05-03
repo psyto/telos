@@ -86,7 +86,7 @@ telos/
 │   ├── telos-settler/    # REVM simulation + decision gating (Weeks 3–6)
 │   ├── telos-submitter/  # signed broadcast + confirmation (Weeks 7–8)
 │   ├── telos-store/      # sqlx + sqlite event log per intent (Week 9)
-│   ├── telos-precompile/ # Reth execution extension (Week 10+) [planned]
+│   ├── telos-precompile/ # custom EVM precompile: intent_digest (Week 10)
 │   └── telos-cli/        # binary entry point
 └── Cargo.toml            # workspace
 ```
@@ -115,6 +115,8 @@ Both modes — empty in-memory state (`simulate_settlement`) and forked from a l
 After broadcast, `submit_and_confirm` awaits the receipt under a `ConfirmConfig { confirmations, timeout }` budget and decodes any emitted `OrderPlaced` event from the receipt logs. Returns a typed `SettlementResult`: `DryRun`, `Confirmed { tx_hash, block_number, gas_used, hedge_acked }`, `Failed { ... }` (mined but reverted), or `Timeout { waited_secs }`.
 
 **Persistence** (Week 9): set `TELOS_DB_URL=sqlite://./telos.db` to enable the `telos-store` event log. Every intent's lifecycle — observed → quoted → simulated → decided → settled — is appended as JSON-payload rows in a single `intent_events` table. On startup the CLI reports how many intents were observed but never settled in a previous run (the reconciliation set). Store writes are best-effort; a sqlite hiccup is logged but never poisons the in-memory pipeline.
+
+**Custom precompile** (Week 10): `telos-precompile` exposes `intent_digest`, an Eth-style precompile at `0x…0901` that hashes the canonical intent fields and returns a 32-byte digest. The crate is node-agnostic — it ships the function and unit tests; wiring it into a Reth node (via `PrecompileProvider`) is the deliberate next step, not in this commit.
 
 This repository is private during the learning phase. It will open if and when the architecture stabilizes.
 

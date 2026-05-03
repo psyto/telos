@@ -6,6 +6,7 @@ members = [
     "crates/telos-settler",
     "crates/telos-submitter",
     "crates/telos-store",
+    "crates/telos-precompile",
     "crates/telos-cli",
 ]
 
@@ -23,6 +24,7 @@ telos-listener = { path = "crates/telos-listener" }
 telos-settler = { path = "crates/telos-settler" }
 telos-submitter = { path = "crates/telos-submitter" }
 telos-store = { path = "crates/telos-store" }
+telos-precompile = { path = "crates/telos-precompile" }
 
 alloy = { version = "1.0", features = ["full"] }
 revm = { version = "38", features = ["alloydb"] }
