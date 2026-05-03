@@ -697,6 +697,141 @@ use telos_settler::abi::IHyperliquidGateway;
 
 ---
 
+## Week 9 — Persistence with sqlx
+
+**What you build.** A `telos-store` crate that writes every intent's
+lifecycle into sqlite via sqlx. One append-only `intent_events` table
+keyed by `intent_id`. The listener records at every stage —
+observed → quoted → simulated → decided → settled — and on startup the
+CLI reports how many intents were observed but never settled in the
+previous run.
+
+**What you learn.**
+
+The first decision is **schema shape**: per-stage tables vs a single
+event log. Per-stage tables give you stronger typing and cleaner
+queries, but they couple the schema to the domain types — every change
+to `RouteQuote` or `SimulationOutcome` is a migration. The single
+events table treats the lifecycle as what it is — append-only — and
+keeps the schema stable while the domain evolves. The cost is no
+SQL-level filtering on payload contents, but that is what the
+application layer is for.
+
+```sql
+CREATE TABLE intent_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    intent_id    TEXT    NOT NULL,
+    stage        TEXT    NOT NULL,
+    payload_json TEXT    NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+```
+
+The sqlx workflow is **migrations + pool**. `sqlx::migrate!("./migrations")`
+expands at compile time into an embedded migrator that runs whatever
+`*.sql` files live in the directory. `SqlitePool::connect_with(opts)`
+gives you a cheap-to-clone pool — internally `Arc`-shared, so every
+`Store` clone hands out connections from the same backing pool.
+
+```rust
+let opts = SqliteConnectOptions::from_str(url)?
+    .create_if_missing(true);
+let pool = SqlitePool::connect_with(opts).await?;
+
+sqlx::migrate!("./migrations")
+    .run(&pool)
+    .await?;
+```
+
+`payload: impl Serialize` lets the store stay generic over what the
+application is recording. Each stage hands in its own struct
+(`PaymentIntent`, `RouteQuote`, `SimulationOutcome`,
+`SettlerDecision`, `SettlementResult`); the store turns whichever it
+gets into a JSON string and writes the row. No giant enum, no
+per-stage method.
+
+```rust
+pub async fn record_event<P: Serialize>(
+    &self,
+    intent_id: B256,
+    stage: Stage,
+    payload: &P,
+) -> Result<()> {
+    let payload_json = serde_json::to_string(payload)?;
+    sqlx::query(
+        "INSERT INTO intent_events (intent_id, stage, payload_json, created_at) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(format!("{:#x}", intent_id))
+    .bind(stage.as_str())
+    .bind(&payload_json)
+    .bind(now_secs())
+    .execute(&self.pool)
+    .await?;
+    Ok(())
+}
+```
+
+The most important architectural rule for any persistence layer
+attached to a hot pipeline: **store failures must not poison the
+pipeline**. The in-memory feedback loop is the source of truth for
+correctness; the database is a side channel for restart reconciliation
+and operator queries. A sqlite write that times out should produce a
+warning log line and nothing else — never a panic, never a `?` that
+unwinds the whole task.
+
+```rust
+async fn record<P: serde::Serialize>(
+    store: &Option<Store>,
+    intent_id: B256,
+    stage: Stage,
+    payload: &P,
+) {
+    if let Some(s) = store
+        && let Err(err) = s.record_event(intent_id, stage, payload).await
+    {
+        // log and move on — never let the store poison the pipeline
+        warn!(?err, ?stage, %intent_id, "store write failed");
+    }
+}
+```
+
+The reconciliation query — distinct intents that have an `observed`
+row but no `settled` row — is the simplest "what was in flight when we
+crashed" question you can ask of an event log. The CLI logs that
+count at startup so an operator notices when restart leaves work
+behind. Real reconciliation logic (re-quote? abandon? mark stale?)
+lives downstream; for now the visibility is the point.
+
+```rust
+pub async fn count_pending(&self) -> Result<u64> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT intent_id) FROM intent_events \
+         WHERE stage = 'observed' \
+           AND intent_id NOT IN ( \
+               SELECT DISTINCT intent_id FROM intent_events WHERE stage = 'settled' \
+           )",
+    )
+    .fetch_one(&self.pool)
+    .await?;
+    Ok(row.0 as u64)
+}
+```
+
+Persistence is opt-in via `TELOS_DB_URL`. Unset the env var and the
+listener runs exactly as before — no sqlite, no migration, no on-disk
+state. This matters during local development and during the learning
+phase: you can iterate on the simulator without managing a database.
+
+**Where to look.**
+
+- `crates/telos-store/migrations/0001_initial.sql` — the schema ([this commit])
+- `crates/telos-store/src/lib.rs` — `Store::open`, `record_event`, `count_pending` ([this commit])
+- `crates/telos-listener/src/lib.rs` — `record()` helper, store calls in `spawn_simulation` ([this commit])
+- `crates/telos-cli/src/main.rs` — `build_store`, `TELOS_DB_URL` ([this commit])
+
+---
+
 ## Quick reference
 
 When you want to look something up rather than re-read the chapter.
@@ -734,3 +869,10 @@ When you want to look something up rather than re-read the chapter.
 | **Architecture** | Inline vs worker placement | listener/lib.rs `spawn_simulation` |
 | **Architecture** | Telos signs only what Telos owns | settler/lib.rs `SubmissionPlan` doc |
 | **Architecture** | Mock interfaces during development | settler/abi.rs `IHyperliquidGateway` |
+| **sqlx** | Migrations via `sqlx::migrate!()` | store/src/lib.rs `Store::open` |
+| **sqlx** | `SqlitePool` is `Arc`-shared, cheap to clone | store/src/lib.rs |
+| **sqlx** | Generic `record_event<P: Serialize>` over JSON payload | store/src/lib.rs |
+| **Design** | Single events table for lifecycle log | store/migrations/0001_initial.sql |
+| **Design** | Store writes are best-effort, never poison the pipeline | listener/src/lib.rs `record` helper |
+| **Architecture** | Persistence is opt-in via env var | cli/src/main.rs `build_store` |
+| **Architecture** | Pending-intents query for restart reconciliation | store/src/lib.rs `count_pending` |

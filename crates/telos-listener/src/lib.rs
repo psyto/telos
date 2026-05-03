@@ -26,6 +26,7 @@ use telos_settler::{
     PriceBook, SettlerDecision, SubmitConfig, quote_route, should_submit, simulate_settlement,
     simulate_settlement_forked,
 };
+use telos_store::{Stage, Store};
 use telos_submitter::{ConfirmConfig, Submitter};
 use telos_types::{Fill, PaymentIntent};
 use tracing::{info, warn};
@@ -51,6 +52,7 @@ pub async fn watch_headers(ws_url: &str) -> Result<()> {
 }
 
 /// Subscribe to Tempo `PaymentIntent` logs and decode each one.
+#[allow(clippy::too_many_arguments)]
 pub async fn watch_intents(
     ws_url: &str,
     contract: Address,
@@ -58,6 +60,7 @@ pub async fn watch_intents(
     hedge_venue: Option<Address>,
     fork_url: Option<String>,
     submitter: Option<Submitter>,
+    store: Option<Store>,
 ) -> Result<()> {
     let provider = ProviderBuilder::new().connect_ws(WsConnect::new(ws_url)).await?;
     let mut stream = provider.subscribe_logs(&intent_filter(contract)).await?.into_stream();
@@ -69,6 +72,7 @@ pub async fn watch_intents(
         forked = fork_url.is_some(),
         hedging = hedge_venue.is_some(),
         submitting = submitter.is_some(),
+        persisting = store.is_some(),
         "subscribed to PaymentIntent logs",
     );
 
@@ -80,6 +84,7 @@ pub async fn watch_intents(
                 hedge_venue,
                 fork_url.clone(),
                 submitter.clone(),
+                store.clone(),
             );
         }
     }
@@ -119,6 +124,7 @@ pub async fn watch_both(
     hedge_venue: Option<Address>,
     fork_url: Option<String>,
     submitter: Option<Submitter>,
+    store: Option<Store>,
 ) -> Result<()> {
     let tempo = ProviderBuilder::new().connect_ws(WsConnect::new(tempo_url)).await?;
     let hl = ProviderBuilder::new().connect_ws(WsConnect::new(hl_url)).await?;
@@ -141,6 +147,7 @@ pub async fn watch_both(
         forked = fork_url.is_some(),
         hedging = hedge_venue.is_some(),
         submitting = submitter.is_some(),
+        persisting = store.is_some(),
         "multiplexing intent + fill streams",
     );
 
@@ -154,6 +161,7 @@ pub async fn watch_both(
                         hedge_venue,
                         fork_url.clone(),
                         submitter.clone(),
+                        store.clone(),
                     );
                 }
             }
@@ -230,16 +238,20 @@ fn decode_fill(log: &Log) -> Option<Fill> {
 }
 
 /// Quote the route, dispatch the settler simulation, gate on the outcome,
-/// and hand the plan to the submitter when approved. All on a spawned task
-/// so the listener loop stays responsive — forked sims block on RPC fetches.
+/// hand the plan to the submitter when approved, and persist each lifecycle
+/// stage to the store. All on a spawned task so the listener loop stays
+/// responsive — forked sims block on RPC fetches.
 fn spawn_simulation(
     intent: PaymentIntent,
     prices: PriceBook,
     hedge_venue: Option<Address>,
     fork_url: Option<String>,
     submitter: Option<Submitter>,
+    store: Option<Store>,
 ) {
     tokio::spawn(async move {
+        record(&store, intent.intent_id, Stage::Observed, &intent).await;
+
         let route = match hedge_venue {
             Some(venue) => match quote_route(&intent, &prices, venue).await {
                 Some(r) => {
@@ -253,6 +265,7 @@ fn spawn_simulation(
                         price_age_secs = r.price_age_secs,
                         "quoted",
                     );
+                    record(&store, intent.intent_id, Stage::Quoted, &r).await;
                     Some(r)
                 }
                 None => {
@@ -289,17 +302,23 @@ fn spawn_simulation(
                 return;
             }
         };
+        record(&store, intent.intent_id, Stage::Simulated, &outcome).await;
 
         let decision = should_submit(&outcome, route.as_ref(), &intent, &SubmitConfig::default());
+        record(&store, intent.intent_id, Stage::Decided, &decision).await;
+
         match decision {
             SettlerDecision::Submit(plan) => match submitter.as_ref() {
                 Some(s) => match s.submit_and_confirm(&plan, ConfirmConfig::default()).await {
-                    Ok(result) => info!(
-                        target: "telos::listener",
-                        intent_id = %intent.intent_id,
-                        ?result,
-                        "settled",
-                    ),
+                    Ok(result) => {
+                        info!(
+                            target: "telos::listener",
+                            intent_id = %intent.intent_id,
+                            ?result,
+                            "settled",
+                        );
+                        record(&store, intent.intent_id, Stage::Settled, &result).await;
+                    }
                     Err(err) => warn!(
                         target: "telos::listener",
                         ?err,
@@ -322,4 +341,20 @@ fn spawn_simulation(
             ),
         }
     });
+}
+
+/// Persist one lifecycle event, but never let a store failure poison the
+/// listener — the in-memory pipeline is the source of truth, the log is
+/// for restart reconciliation and operator queries.
+async fn record<P: serde::Serialize>(
+    store: &Option<Store>,
+    intent_id: alloy::primitives::B256,
+    stage: Stage,
+    payload: &P,
+) {
+    if let Some(s) = store
+        && let Err(err) = s.record_event(intent_id, stage, payload).await
+    {
+        warn!(target: "telos::listener", ?err, ?stage, %intent_id, "store write failed");
+    }
 }

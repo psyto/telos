@@ -34,6 +34,7 @@ use revm::{
     database::{AlloyDB, CacheDB, EmptyDB, WrapDatabaseAsync},
     primitives::{TxKind, U256},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,7 +44,7 @@ use tracing::info;
 
 /// Per-leg result. The settler reports both legs independently so the caller
 /// can see *which* leg blocked atomic settlement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegOutcome {
     pub success: bool,
     pub gas_used: u64,
@@ -52,7 +53,7 @@ pub struct LegOutcome {
 
 /// Combined two-leg simulation result. `atomic_success` is the AND of both
 /// legs (or just `spot` when no `RouteQuote` was supplied).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationOutcome {
     pub spot: LegOutcome,
     pub hedge: Option<LegOutcome>,
@@ -64,7 +65,7 @@ pub struct SimulationOutcome {
 /// One transaction the submitter would broadcast on Telos's behalf.
 /// Only `to`, `data`, and `gas_limit` are decided here; the submitter fills
 /// nonce, gas price, and chain id.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedTx {
     pub to: Address,
     pub data: Bytes,
@@ -75,19 +76,19 @@ pub struct PreparedTx {
 /// is the merchant's settlement, initiated by the payer on Tempo, observed
 /// here for *gating* but not broadcast by us. A bundler/Permit2 design
 /// would change that; deferred.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmissionPlan {
     pub intent_id: alloy::primitives::B256,
     pub hedge: PreparedTx,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SettlerDecision {
     Submit(SubmissionPlan),
     Reject(RejectReason),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RejectReason {
     NoQuote,
     SpotWouldRevert(Option<String>),

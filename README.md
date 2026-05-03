@@ -84,8 +84,9 @@ telos/
 │   ├── telos-types/      # shared types: Intent, RouteQuote, etc.
 │   ├── telos-listener/   # Alloy-based event listener (Week 1–2)
 │   ├── telos-settler/    # REVM simulation + decision gating (Weeks 3–6)
-│   ├── telos-submitter/  # signed broadcast layer, dry-run by default (Week 7)
-│   ├── telos-precompile/ # Reth execution extension (Week 8+) [planned]
+│   ├── telos-submitter/  # signed broadcast + confirmation (Weeks 7–8)
+│   ├── telos-store/      # sqlx + sqlite event log per intent (Week 9)
+│   ├── telos-precompile/ # Reth execution extension (Week 10+) [planned]
 │   └── telos-cli/        # binary entry point
 └── Cargo.toml            # workspace
 ```
@@ -112,6 +113,8 @@ Both modes — empty in-memory state (`simulate_settlement`) and forked from a l
 **Submitter** (Weeks 7–8): when approved, the hedge tx is handed to a `Submitter` backed by an Alloy wallet-aware provider. **Dry-run by default**: estimates gas and logs the intended broadcast. Set `TELOS_BROADCAST=1` *and* provide `TELOS_SIGNER_KEY` + `TELOS_SUBMIT_RPC_URL` to actually broadcast. Telos signs only the hedge — the spot leg is the merchant's settlement, observed for gating but not broadcast by us.
 
 After broadcast, `submit_and_confirm` awaits the receipt under a `ConfirmConfig { confirmations, timeout }` budget and decodes any emitted `OrderPlaced` event from the receipt logs. Returns a typed `SettlementResult`: `DryRun`, `Confirmed { tx_hash, block_number, gas_used, hedge_acked }`, `Failed { ... }` (mined but reverted), or `Timeout { waited_secs }`.
+
+**Persistence** (Week 9): set `TELOS_DB_URL=sqlite://./telos.db` to enable the `telos-store` event log. Every intent's lifecycle — observed → quoted → simulated → decided → settled — is appended as JSON-payload rows in a single `intent_events` table. On startup the CLI reports how many intents were observed but never settled in a previous run (the reconciliation set). Store writes are best-effort; a sqlite hiccup is logged but never poisons the in-memory pipeline.
 
 This repository is private during the learning phase. It will open if and when the architecture stabilizes.
 

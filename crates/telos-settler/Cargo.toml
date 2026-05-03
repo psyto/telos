@@ -10,6 +10,7 @@ repository.workspace = true
 telos-types = { workspace = true }
 alloy = { workspace = true }
 revm = { workspace = true }
+serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }

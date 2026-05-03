@@ -14,6 +14,7 @@ path = "src/main.rs"
 telos-listener = { workspace = true }
 telos-settler = { workspace = true }
 telos-submitter = { workspace = true }
+telos-store = { workspace = true }
 alloy = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

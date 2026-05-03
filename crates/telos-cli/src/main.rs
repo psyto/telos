@@ -2,6 +2,7 @@ use alloy::primitives::Address;
 use eyre::{Result, WrapErr};
 use telos_listener::{watch_both, watch_fills, watch_headers, watch_intents};
 use telos_settler::PriceBook;
+use telos_store::Store;
 use telos_submitter::Submitter;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -15,6 +16,7 @@ async fn main() -> Result<()> {
     let hedge_venue = cfg.hedge_venue;
     let prices = PriceBook::new();
     let submitter = build_submitter(&cfg)?;
+    let store = build_store(&cfg).await?;
 
     match cfg.mode() {
         Mode::Both { tempo_url, tempo_contract, hl_url, hl_contract } => {
@@ -27,11 +29,12 @@ async fn main() -> Result<()> {
                 hedge_venue,
                 fork_url,
                 submitter,
+                store,
             )
             .await
         }
         Mode::Intents { url, contract } => {
-            watch_intents(&url, contract, prices, hedge_venue, fork_url, submitter).await
+            watch_intents(&url, contract, prices, hedge_venue, fork_url, submitter, store).await
         }
         Mode::Fills { url, contract } => watch_fills(&url, contract, prices).await,
         Mode::Headers { url } => watch_headers(&url).await,
@@ -49,6 +52,7 @@ struct Config {
     submit_rpc: Option<String>,
     signer_key: Option<String>,
     broadcast: bool,
+    db_url: Option<String>,
 }
 
 enum Mode {
@@ -77,6 +81,7 @@ impl Config {
             submit_rpc: std::env::var("TELOS_SUBMIT_RPC_URL").ok(),
             signer_key: std::env::var("TELOS_SIGNER_KEY").ok(),
             broadcast: matches!(std::env::var("TELOS_BROADCAST").as_deref(), Ok("1")),
+            db_url: std::env::var("TELOS_DB_URL").ok(),
         })
     }
 
@@ -121,6 +126,22 @@ fn build_submitter(cfg: &Config) -> Result<Option<Submitter>> {
         "submitter ready",
     );
     Ok(Some(submitter))
+}
+
+async fn build_store(cfg: &Config) -> Result<Option<Store>> {
+    let url = match cfg.db_url.as_ref() {
+        Some(u) => u,
+        None => return Ok(None),
+    };
+    let store = Store::open(url).await?;
+    let pending = store.count_pending().await.unwrap_or(0);
+    info!(
+        target: "telos::cli",
+        url,
+        pending,
+        "store opened — these intents were observed but never settled in a previous run",
+    );
+    Ok(Some(store))
 }
 
 fn parse_addr(var: &str) -> Result<Option<Address>> {
