@@ -1310,9 +1310,9 @@ actually own) is identical regardless of which node hosts it.
 
 **Where to look.**
 
-- `crates/telos-node/src/rpc.rs` — `TelosRpc` trait + `TelosNode` impl + `run_eth_call` dispatch ([this commit])
-- `crates/telos-node/src/server.rs` — `run_server` bootstrap with `:0`-friendly bind reporting ([this commit])
-- `crates/telos-node/tests/eth_call.rs` — integration test with real HTTP client ([this commit])
+- `crates/telos-node/src/rpc.rs` — `TelosRpc` trait + `TelosNode` impl + `run_eth_call` dispatch ([3cee368](https://github.com/psyto/telos/commit/3cee368))
+- `crates/telos-node/src/server.rs` — `run_server` bootstrap with `:0`-friendly bind reporting ([3cee368](https://github.com/psyto/telos/commit/3cee368))
+- `crates/telos-node/tests/eth_call.rs` — integration test with real HTTP client ([3cee368](https://github.com/psyto/telos/commit/3cee368))
 
 ---
 
