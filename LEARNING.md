@@ -1078,8 +1078,8 @@ provider are the artifact; the node is the deployment target.
 
 **Where to look.**
 
-- `crates/telos-precompile/src/lib.rs` — `TelosPrecompiles`, `PrecompileProvider` impl, `eth_result_to_interpreter` ([this commit])
-- `crates/telos-precompile/src/lib.rs#tests` — `evm_call_returns_canonical_digest` integration test ([this commit])
+- `crates/telos-precompile/src/lib.rs` — `TelosPrecompiles`, `PrecompileProvider` impl, `eth_result_to_interpreter` ([fc459e9](https://github.com/psyto/telos/commit/fc459e9))
+- `crates/telos-precompile/src/lib.rs#tests` — `evm_call_returns_canonical_digest` integration test ([fc459e9](https://github.com/psyto/telos/commit/fc459e9))
 
 ---
 
